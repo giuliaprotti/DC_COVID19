@@ -1,0 +1,13 @@
+patient_id,disease,severity,age,gender,days_since_symptom_onset
+cov01,covid,severe,75,F,15
+cov02,covid,moderate,53,F,9
+cov03,covid,moderate,75,F,2
+cov04,covid,severe,59,M,16
+cov07,healthy,NA,84,F,NA
+cov08,healthy,NA,68,F,NA
+cov09,healthy,NA,38,M,NA
+cov10,covid,severe,60,F,15
+cov11,covid,severe,48,M,8
+cov12,covid,moderate,47,F,9
+cov17,healthy,NA,90,M,NA
+cov18,healthy,NA,70,F,NA
