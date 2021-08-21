@@ -1,0 +1,1144 @@
+---
+title: "Reyes et al. 2020 dataset"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output:
+    html_notebook:
+        self_contained: true
+        df_print: paged
+        fig_height: 6
+        fig_width: 6
+        highlight: zenburn
+        theme: cosmo
+        number_sections: yes
+        toc: yes
+        toc_depth: 6
+        toc_float:
+            collapsed: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(DropletUtils)
+library(devtools)
+library(Seurat)
+library(SeuratDisk)
+library(SeuratObject)
+library(SeuratWrappers)
+library(harmony)
+library(future)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(data.table)
+library(scater)
+library(edgeR)
+library(fgsea)
+library(gghighlight)
+library(magrittr)
+library(ggpubr)
+library(scales)
+library(dendsort)
+
+show_dt <- function(df) { 
+    DT::datatable(
+        df,
+        class = "cell-border stripe",
+        rownames = TRUE,
+        escape = FALSE,
+        caption = NULL,
+        editable = FALSE,
+        filter = list(position = "top"),
+        extensions = c('Buttons', 'Scroller'),
+        options = list(
+            dom = 'Blfrtip',
+            scrollX = T,
+            scrollY = 500,
+            buttons = c('copy', 'csv', 'print'),
+            deferRender = TRUE,
+            scroller = TRUE
+        )
+    )
+}
+
+theme_set(theme_classic(14))
+```
+
+```{r}
+gmt.hallmark <- gmtPathways("h.all.v7.2.symbols.gmt")
+gmt.btm <- gmtPathways("BTMgenesets.gmt")
+```
+
+# Load data: retain only monocytes and DCs as defined in the original paper
+
+```{r}
+seu <- ReadH5AD("scp_scanpy.h5ad", assay = "RNA", layers = "data", verbose = T)
+
+metadata <- read.csv(file = "scp_meta.txt", sep='\t')
+metadata <- metadata[-c(1), ]
+
+active.ident <- as.data.frame(seu@active.ident)
+active.ident$NAME <- row.names(active.ident)
+metadata <- subset(metadata, NAME %in% active.ident$NAME)
+
+seu <- AddMetaData(seu, metadata = metadata$Cell_Type, col.name = 'Cell_Type')
+seu <- AddMetaData(seu, metadata = metadata$Cohort, col.name = 'Cohort')
+```
+
+```{r}
+seu <- subset(seu, subset = Cell_Type %in% c("Mono", "DC"))
+```
+
+```{r fig.height=4, fig.width=10}
+seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern="^MT-")
+VlnPlot(seu, assay='RNA', features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0, ncol = 3)
+```
+
+```{r}
+seu <- subset(seu, subset = nFeature_RNA >= 500 & percent.mt < 10)
+```
+
+```{r}
+seu <- SCTransform(seu, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, 
+                   vars.to.regress = c("nCount_RNA", "percent.mt"), variable.features.n = 400, 
+                   return.only.var.genes = T, conserve.memory = T, seed.use = 123, verbose = T)
+```
+
+```{r}
+seu <- RunPCA(seu, assay = "SCT", npcs = 50)
+ElbowPlot(seu, ndims = 30)
+```
+
+```{r}
+seu <- RunHarmony(seu, assay.use = "SCT", group.by.vars = c("patient","Cohort"), reduction = "pca", dims.use = 1:13, verbose = T)
+```
+
+```{r}
+seu <- RunUMAP(seu, reduction = "harmony", dims = 1:13, seed.use = 42, verbose = F)
+seu <- FindNeighbors(seu, dims = 1:13, reduction = "harmony", force.recalc = TRUE)
+seu <- FindClusters(seu, algorithm = 1, resolution = 0.6, random.seed = 1, verbose = F)
+```
+
+```{r}
+saveRDS(seu, file = "seu.rds")
+```
+
+```{r}
+dim(seu)
+```
+```{r fig.height=4, fig.width=10}
+p1 <- DimPlot(seu, group.by = c("seurat_clusters"), label = T)
+p2 <- DimPlot(seu, group.by = c("Cohort"), label = F)
+p1 | p2
+```  
+
+```{r fig.height=14, fig.width=8}
+FeaturePlot(seu, reduction = "umap", features = c("FCER1A","CD1C","CLEC10A","CLEC9A",
+"HLA-DRB1","CD14","CD163","C5AR1","FCGR3A"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol = 2)
+```
+```{r fig.height=6, fig.width=10}
+VlnPlot(seu, features = c('CLEC9A','CLEC10A','CD1C','FCER1A','CD14','CD163','S100A8','CLEC4C',"TCF4"), group.by = "seurat_clusters", same.y.lims = F, log = F, pt.size = 0, ncol=3)
+```
+- cDC1s are cluster 12 
+
+- cDC2s are cluster 6
+
+Keep only clusters 6 and 12 and re-cluster again.
+
+# Drill down into cDCs
+
+```{r}
+mdc <- subset(seu, subset = seurat_clusters %in% c(6,12))
+
+mdc <- SCTransform(mdc, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA"), variable.features.n = 200, return.only.var.genes = F, conserve.memory = F, seed.use = 123)
+
+mdc <- RunPCA(mdc, assay = "SCT", npcs = 50) 
+ElbowPlot(mdc, ndims = 30)
+```
+
+```{r}
+mdc <- RunHarmony(mdc, assay.use = "SCT", group.by.vars = c("patient","Cohort"), reduction = "pca", dims.use = 1:13, verbose = T)
+mdc <- RunUMAP(mdc, reduction = "harmony", dims = 1:13, seed.use = 42, verbose = F)
+mdc <- FindNeighbors(mdc, dims = 1:13, reduction = "harmony", force.recalc = TRUE) 
+mdc <- FindClusters(mdc, algorithm = 1, resolution = 0.2, random.seed = 1, verbose = F)
+```
+
+```{r fig.height=3.5, fig.width=8}
+p1 <- DimPlot(mdc, group.by = c("seurat_clusters"), label = T)
+p2 <- DimPlot(mdc, group.by = c("Cohort"), label = F)
+p1 | p2
+```  
+
+```{r fig.height=20, fig.width=8}
+FeaturePlot(mdc, reduction = "umap", features = c("CLEC9A","XCR1","FLT3","CD1C","CLEC10A","FCER1A", "CD163","CD14","S100A8","VCAN","FCGR3A","HLA-DRB1","C5AR1","AXL","CLEC4C","TCF4"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol = 2)
+```
+```{r fig.height=6, fig.width=12}
+VlnPlot(mdc, features = c('HLA-DRB1','CLEC10A','CLEC9A','CD1C','FCER1A','CD163','CD14','S100A8','CLEC4C',"TCF4"), group.by = "seurat_clusters", same.y.lims = F, log = F, pt.size = 0, ncol=5)
+```
+Cluster 5: contaminant (positive for TCF4 ad CLEC4C). Remove cluster 5 and re-cluster to clean further.
+
+```{r}
+mdc2 <- subset(mdc, subset = seurat_clusters %in% c(0,1,2,3,4,6,7))
+```
+
+```{r}
+mdc2 <- SCTransform(mdc2, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA"), variable.features.n = 100, return.only.var.genes = F, conserve.memory = F, seed.use = 123)
+
+mdc2 <- RunPCA(mdc2, assay = "SCT", npcs = 50) 
+ElbowPlot(mdc2, ndims = 30) 
+
+mdc2 <- RunHarmony(mdc2, assay.use = "SCT", group.by.vars = c("patient","Cohort"), reduction = "pca", dims.use = 1:13, verbose = T)
+mdc2 <- RunUMAP(mdc2, reduction = "harmony", dims = 1:13, seed.use = 42, verbose = F)
+mdc2 <- FindNeighbors(mdc2, dims = 1:13, reduction = "harmony", force.recalc = TRUE) 
+mdc2 <- FindClusters(mdc2, algorithm = 1, resolution = 0.1, random.seed = 1, verbose = F)
+```
+
+```{r fig.height=3, fig.width=5.5}
+p1 <- DimPlot(mdc2, group.by = "seurat_clusters", cols = c('3' = '#ED68ED', '4' = '#00BE67', '2' = '#7CAE00', '0' = '#0CB702', '1' = '#00A9FF'), label = T) + NoLegend()
+p2 <- DimPlot(mdc2, group.by = c("Cohort"), label = F)
+p1 | p2
+```  
+
+```{r fig.height=10, fig.width=8}
+FeaturePlot(mdc2, reduction = "umap", features =c("CLEC9A","XCR1","FLT3","CD1C","CLEC10A","FCER1A", "CD163","CD14","S100A8","VCAN","HLA-DRB1"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol = 3)
+```
+```{r fig.height=4.5, fig.width=5}
+VlnPlot(mdc2, features = c('HLA-DRB1','CLEC10A','CLEC9A','CD14','CD163','S100A8'), cols = c('3' = '#ED68ED', '4' = '#00BE67', '2' = '#7CAE00', '0' = '#0CB702', '1' = '#00A9FF'), group.by = "seurat_clusters", same.y.lims = F, log = F, pt.size = 0, ncol=3)
+```
+Three cDC subsets are identified:
+
+- cDC1 are cluster 3 
+
+- DC3 are cluster 1
+
+- DC2 are clusters 0,2,4
+
+```{r}
+mdc2$dc <- ifelse(
+    mdc2$seurat_clusters %in% c(0,2,4), "DC2", ifelse(
+    mdc2$seurat_clusters %in% c(1), "DC3", "cDC1"
+))
+```
+
+# Pseudo-bulk Differential Expression
+
+Aggregate DCs by type and donor, then run differential test on aggregated counts. This ensures that the unit of independent replication is the sample (donor), not the cell.
+
+Cohort description:
+
+- Control: healthy samples (n=19)
+  
+  Primary Cohort: 
+  
+- Leuk-UTI: urinary tract infection (UTI) with leukocytosis but no organ dysfunction (n=10, enrolled within 12h of presentation to the emergency department)
+
+- Int-URO: UTI with mild or transient organ dysfunction - intermediate urosepsis (n=7, enrolled within 12h of presentation to the emergency department)
+
+- URO: UTI with clear or persistent organ dysfunction - urosepsis (n=10, enrolled within 12h of presentation to the emergency department)
+
+  Secondary Cohort:
+
+- Bac-SEP: bacteremic individuals with sepsis in hospital wards (n=4, enrolled at least 24h after initial hospital presentation and receipt of intravenous antibiotics)
+
+- ICU-SEP: individuals admitted to the medical intensive care unit with sepsis (n=8, enrolled at least 24h after initial hospital presentation and receipt of intravenous antibiotics)
+
+- ICU-NoSEP: individuals admitted to the medical intensive care unit without sepsis (n=7, enrolled at least 24h after initial hospital presentation and receipt of intravenous antibiotics)
+
+Focus on Int-URO vs Healthy, URO vs Healthy and Leuk-UTI vs Healthy.
+
+Consider only healthy samples, Leuk-UTI, Int-URO and URO. 
+
+```{r}
+mdc2 <- subset(mdc2, subset = Cohort %in% c('Control','Leuk-UTI','Int-URO','URO'))
+```
+
+```{r}
+saveRDS(mdc2, 'mdc_bacterial_infections.rds')
+```
+
+```{r}
+sce <- as.SingleCellExperiment(mdc2, assay = "SCT")
+sce <- sce[rowSums(counts(sce) > 1) >= 10, ]
+
+t(table(sce$dc, sce$patient))
+t(table(sce$Cohort, sce$patient))
+```
+Focus only on DC2s and DC3s. 
+
+## DC2
+
+Keep donors with at least 10 DC2 -> 25 donors (11 healthy, 3 URO, 6 Int-URO, 5 Leuk-UTI). 
+
+```{r}
+sce_dc2 <- sce[, (sce$patient %in% c("4","5","7","8","9","10","11","12","13","14","15","16","17","18",
+                                     "19","25","26","27","30","38","42","43","44","45","47")) & 
+                 (sce$dc == 'DC2')]
+t(table(sce_dc2$dc, sce_dc2$patient))
+```
+### LeukUTI vs Healthy
+
+#### DEGs 
+
+```{r}
+sce_dc2$group_id <- factor(sce_dc2$Cohort, levels = c("Control","Leuk-UTI","Int-URO","URO"))
+sce_dc2$sample_id <- factor(sce_dc2$patient)
+
+dge_dc2 <- aggregateAcrossCells(sce_dc2, id = colData(sce_dc2)[, c("sample_id")])
+dge_dc2 <- calcNormFactors(dge_dc2)
+
+mtx_dc2 <- t(scale(t(edgeR::cpm(dge_dc2, log = T))))
+colnames(mtx_dc2) <- paste(dge_dc2$samples$group_id, dge_dc2$samples$sample_id, sep = "_")
+
+dsn_dc2 <- model.matrix(~ group_id, dge_dc2$samples)
+dge_dc2 <- estimateDisp(dge_dc2, dsn_dc2)
+fit_dc2 <- glmQLFit(dge_dc2, dsn_dc2, robust = T)
+
+res_dc2_leukuti <- glmQLFTest(fit_dc2, coef = "group_idLeuk-UTI") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2_leukuti %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc2_leukuti <- setNames(-log10(res_dc2_leukuti$PValue) * sign(res_dc2_leukuti$logFC), res_dc2_leukuti$gene)
+gsa_dc2_leukuti.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2_leukuti, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_leukuti.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc2_leukuti.btm <- fgseaMultilevel(gmt.btm, rnk_dc2_leukuti, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_leukuti.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+### IntURO vs Healthy
+
+#### DEGs
+
+```{r}
+res_dc2_inturo <- glmQLFTest(fit_dc2, coef = "group_idInt-URO") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2_inturo %>%
+    show_dt()
+```
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc2_inturo <- setNames(-log10(res_dc2_inturo$PValue) * sign(res_dc2_inturo$logFC), res_dc2_inturo$gene)
+gsa_dc2_inturo.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2_inturo, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_inturo.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc2_inturo.btm <- fgseaMultilevel(gmt.btm, rnk_dc2_inturo, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_inturo.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+### URO vs Healthy
+
+#### DEGs
+
+```{r}
+res_dc2_uro <- glmQLFTest(fit_dc2, coef = "group_idURO") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2_uro %>%
+    show_dt()
+```
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc2_uro <- setNames(-log10(res_dc2_uro$PValue) * sign(res_dc2_uro$logFC), res_dc2_uro$gene)
+gsa_dc2_uro.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2_uro, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_uro.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc2_uro.btm <- fgseaMultilevel(gmt.btm, rnk_dc2_uro, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_uro.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+## DC3
+
+Keep donors with at least 10 DC3 -> 25 donors (10 healthy, 4 URO, 5 Int-URO, 6 Leuk-UTI).
+
+```{r}
+sce_dc3 <- sce[, (sce$patient %in% c("0","1","2","4","5","6","8","9","12","13","14","16","17","19","25","26","27","28","30","37","38","42","44","46","49")) & (sce$dc == "DC3")]
+t(table(sce_dc3$dc, sce_dc3$patient))
+```
+### LeukUTI vs Healthy
+
+#### DEGs 
+
+```{r}
+sce_dc3$group_id <- factor(sce_dc3$Cohort, levels = c("Control","Leuk-UTI","Int-URO","URO"))
+sce_dc3$sample_id <- factor(sce_dc3$patient)
+
+dge_dc3 <- aggregateAcrossCells(sce_dc3, id = colData(sce_dc3)[, c("sample_id")])
+dge_dc3 <- calcNormFactors(dge_dc3)
+
+mtx_dc3 <- t(scale(t(edgeR::cpm(dge_dc3, log = T))))
+colnames(mtx_dc3) <- paste(dge_dc3$samples$group_id, dge_dc3$samples$sample_id, sep = "_")
+
+dsn_dc3 <- model.matrix(~ group_id, dge_dc3$samples)
+dge_dc3 <- estimateDisp(dge_dc3, dsn_dc3)
+fit_dc3 <- glmQLFit(dge_dc3, dsn_dc3, robust = T)
+
+res_dc3_leukuti <- glmQLFTest(fit_dc3, coef = "group_idLeuk-UTI") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3_leukuti %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark
+
+```{r}
+rnk_dc3_leukuti <- setNames(-log10(res_dc3_leukuti$PValue) * sign(res_dc3_leukuti$logFC), res_dc3_leukuti$gene)
+gsa_dc3_leukuti.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3_leukuti, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_leukuti.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc3_leukuti.btm <- fgseaMultilevel(gmt.btm, rnk_dc3_leukuti, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_leukuti.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+### IntURO vs Healthy
+
+#### DEGs
+
+```{r}
+res_dc3_inturo <- glmQLFTest(fit_dc3, coef = "group_idInt-URO") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3_inturo %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark
+
+```{r}
+rnk_dc3_inturo <- setNames(-log10(res_dc3_inturo$PValue) * sign(res_dc3_inturo$logFC), res_dc3_inturo$gene)
+gsa_dc3_inturo.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3_inturo, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_inturo.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc3_inturo.btm <- fgseaMultilevel(gmt.btm, rnk_dc3_inturo, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_inturo.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+### URO vs Healthy
+
+#### DEGs
+
+```{r}
+res_dc3_uro <- glmQLFTest(fit_dc3, coef = "group_idURO") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3_uro %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark
+
+```{r}
+rnk_dc3_uro <- setNames(-log10(res_dc3_uro$PValue) * sign(res_dc3_uro$logFC), res_dc3_uro$gene)
+gsa_dc3_uro.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3_uro, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_uro.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc3_uro.btm <- fgseaMultilevel(gmt.btm, rnk_dc3_uro, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_uro.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+# Heatmap with top 100 DEGs for DC2 and DC3
+
+Rows: Top 100 DEGs for DC2 or DC3 in Disease vs Healthy
+
+Columns: samples aggregated by donor and cell type
+
+Cells: Z-scores, log2 CPMs
+
+Remove RP genes.
+
+## DC2
+
+### Leuk-UTI vs Healthy
+
+```{r}
+genes_dc2_leukuti <- arrange(res_dc2_leukuti, PValue)
+genes_dc2_leukuti <- genes_dc2_leukuti[!grepl("^RP[LS]",genes_dc2_leukuti$gene),]
+genes_dc2_leukuti_top100 <- genes_dc2_leukuti[1:100, 1]
+
+mtx_dc2.df <- as.data.frame(mtx_dc2)
+mtx_dc2.df$gene <- row.names(mtx_dc2.df)
+
+mtx_dc2_leukuti.df_top100 <- merge(genes_dc2_leukuti_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2_leukuti.df_top100) <- mtx_dc2_leukuti.df_top100$gene
+mtx_dc2_leukuti.df_top100$gene <- NULL
+mtx_dc2_leukuti.df_top100 <- mtx_dc2_leukuti.df_top100[,c(1,2,4,8,10,12,15,17,20,22,24,16,18,21,23,25)]
+```
+
+```{r fig.height=9, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc2_leukuti.df_top100), method="ward.D2"), isReverse = TRUE)
+
+mtx_dc2_leukuti.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### IntURO vs Healthy
+
+```{r}
+genes_dc2_inturo <- arrange(res_dc2_inturo, PValue)
+genes_dc2_inturo <- genes_dc2_inturo[!grepl("^RP[LS]",genes_dc2_inturo$gene),]
+genes_dc2_inturo_top100 <- genes_dc2_inturo[1:100, 1]
+
+mtx_dc2_inturo.df_top100 <- merge(genes_dc2_inturo_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2_inturo.df_top100) <- mtx_dc2_inturo.df_top100$gene
+mtx_dc2_inturo.df_top100$gene <- NULL
+mtx_dc2_inturo.df_top100 <- mtx_dc2_inturo.df_top100[,c(1,2,4,8,10,12,15,17,20,22,24,5,6,9,13,14,19)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc2_inturo.df_top100), method="ward.D2"))
+
+mtx_dc2_inturo.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### URO vs Healthy
+
+```{r}
+genes_dc2_uro <- arrange(res_dc2_uro, PValue)
+genes_dc2_uro <- genes_dc2_uro[!grepl("^RP[LS]",genes_dc2_uro$gene),]
+genes_dc2_uro_top100 <- genes_dc2_uro[1:100, 1]
+
+mtx_dc2_uro.df_top100 <- merge(genes_dc2_uro_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2_uro.df_top100) <- mtx_dc2_uro.df_top100$gene
+mtx_dc2_uro.df_top100$gene <- NULL
+mtx_dc2_uro.df_top100 <- mtx_dc2_uro.df_top100[,c(1,2,4,8,10,12,15,17,20,22,24,3,7,11)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc2_uro.df_top100), method="ward.D2"), isReverse = T)
+
+mtx_dc2_uro.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3
+
+### LeukUTI vs Healthy
+
+```{r}
+genes_dc3_leukuti <- arrange(res_dc3_leukuti, PValue)
+genes_dc3_leukuti <- genes_dc3_leukuti[!grepl("^RP[LS]",genes_dc3_leukuti$gene),]
+genes_dc3_leukuti_top100 <- genes_dc3_leukuti[1:100, 1]
+
+mtx_dc3.df <- as.data.frame(mtx_dc3)
+mtx_dc3.df$gene <- row.names(mtx_dc3.df)
+
+mtx_dc3_leukuti.df_top100 <- merge(genes_dc3_leukuti_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3_leukuti.df_top100) <- mtx_dc3_leukuti.df_top100$gene
+mtx_dc3_leukuti.df_top100$gene <- NULL
+mtx_dc3_leukuti.df_top100 <- mtx_dc3_leukuti.df_top100[,c(2,4,5,7,9,11,12,14,16,21,15,23,24,25)]
+```
+
+```{r fig.height=9, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc3_leukuti.df_top100), method="ward.D2"), isReverse = F)
+
+mtx_dc3_leukuti.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### IntURO vs Healthy
+
+```{r}
+genes_dc3_inturo <- arrange(res_dc3_inturo, PValue)
+genes_dc3_inturo <- genes_dc3_inturo[!grepl("^RP[LS]",genes_dc3_inturo$gene),]
+genes_dc3_inturo_top100 <- genes_dc3_inturo[1:100, 1]
+
+mtx_dc3_inturo.df_top100 <- merge(genes_dc3_inturo_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3_inturo.df_top100) <- mtx_dc3_inturo.df_top100$gene
+mtx_dc3_inturo.df_top100$gene <- NULL
+mtx_dc3_inturo.df_top100 <- mtx_dc3_inturo.df_top100[,c(2,4,5,7,9,11,12,14,16,21,8,10,13,19,20)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc3_inturo.df_top100), method="ward.D2"), isReverse = F)
+
+mtx_dc3_inturo.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### URO vs Healthy
+
+```{r}
+genes_dc3_uro <- arrange(res_dc3_uro, PValue)
+genes_dc3_uro <- genes_dc3_uro[!grepl("^RP[LS]",genes_dc3_uro$gene),]
+genes_dc3_uro_top100 <- genes_dc3_uro[1:100, 1]
+
+mtx_dc3_uro.df_top100 <- merge(genes_dc3_uro_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3_uro.df_top100) <- mtx_dc3_uro.df_top100$gene
+mtx_dc3_uro.df_top100$gene <- NULL
+mtx_dc3_uro.df_top100 <- mtx_dc3_uro.df_top100[,c(2,4,5,7,9,11,12,14,16,21,1,3,6,18)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc3_uro.df_top100), method="ward.D2"))
+
+mtx_dc3_uro.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+# Pathway enrichment visualization
+
+## Hallmark
+
+For each cDC subset, top 10 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2_leukuti.hallmark <- arrange(gsa_dc2_leukuti.hallmark, pval)
+gsa_dc2_leukuti.hallmark_top <- gsa_dc2_leukuti.hallmark[1:10, ]
+
+gsa_dc2_inturo.hallmark <-arrange(gsa_dc2_inturo.hallmark, pval)
+gsa_dc2_inturo.hallmark_top <- gsa_dc2_inturo.hallmark[1:10, ]
+
+gsa_dc2_uro.hallmark <- arrange(gsa_dc2_uro.hallmark, pval)
+gsa_dc2_uro.hallmark_top <- gsa_dc2_uro.hallmark[1:10, ]
+
+gsa_dc3_leukuti.hallmark <- arrange(gsa_dc3_leukuti.hallmark, pval)
+gsa_dc3_leukuti.hallmark_top <- gsa_dc3_leukuti.hallmark[1:10, ] 
+
+gsa_dc3_inturo.hallmark <- arrange(gsa_dc3_inturo.hallmark, pval)
+gsa_dc3_inturo.hallmark_top <- gsa_dc3_inturo.hallmark[1:10, ]
+
+gsa_dc3_uro.hallmark <- arrange(gsa_dc3_uro.hallmark, pval)
+gsa_dc3_uro.hallmark_top <- gsa_dc3_uro.hallmark[1:10, ]
+
+pathways.hallmark <- rbind(gsa_dc2_leukuti.hallmark_top,
+                           gsa_dc2_inturo.hallmark_top, gsa_dc2_uro.hallmark_top, 
+                           gsa_dc3_leukuti.hallmark_top, gsa_dc3_inturo.hallmark_top,
+                           gsa_dc3_uro.hallmark_top)
+pathways.hallmark2 <- pathways.hallmark[!duplicated(pathways.hallmark$pathway),]
+pathways.hallmark2 <- pathways.hallmark2[, -c(2:8)]
+
+result_dc2_leukuti <- merge(pathways.hallmark2, gsa_dc2_leukuti.hallmark)
+result_dc2_leukuti$DC_subsets <- 'DC2 Leuk-UTI'
+result_dc2_leukuti$count <- -log10(result_dc2_leukuti$pval) 
+
+result_dc2_inturo <- merge(pathways.hallmark2, gsa_dc2_inturo.hallmark)
+result_dc2_inturo$DC_subsets <- 'DC2 Int-URO'
+result_dc2_inturo$count <- -log10(result_dc2_inturo$pval)
+
+result_dc2_uro <- merge(pathways.hallmark2, gsa_dc2_uro.hallmark)
+result_dc2_uro$DC_subsets <- 'DC2 URO'
+result_dc2_uro$count <- -log10(result_dc2_uro$pval)
+
+result_dc3_leukuti <- merge(pathways.hallmark2, gsa_dc3_leukuti.hallmark)
+result_dc3_leukuti$DC_subsets <- 'DC3 Leuk-UTI'
+result_dc3_leukuti$count <- -log10(result_dc3_leukuti$pval) 
+
+result_dc3_inturo <- merge(pathways.hallmark2, gsa_dc3_inturo.hallmark)
+result_dc3_inturo$DC_subsets <- 'DC3 Int-URO'
+result_dc3_inturo$count <- -log10(result_dc3_inturo$pval)
+
+result_dc3_uro <- merge(pathways.hallmark2, gsa_dc3_uro.hallmark)
+result_dc3_uro$DC_subsets <- 'DC3 URO'
+result_dc3_uro$count <- -log10(result_dc3_uro$pval)
+
+hallmark <- rbind(result_dc2_leukuti, result_dc2_inturo, result_dc2_uro, result_dc3_leukuti, result_dc3_inturo, result_dc3_uro)
+```
+
+```{r}
+hallmark$pathway <- gsub('HALLMARK_', '', hallmark$pathway)
+hallmark$pathway <- gsub('_', ' ', hallmark$pathway)
+```
+
+```{r}
+order <- setDT(hallmark)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+hallmark <- merge(x = hallmark, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=5.5, fig.width=5.5}
+p <- hallmark %>%
+  mutate(DC_subsets = fct_relevel(DC_subsets, "DC2 Leuk-UTI", "DC2 Int-URO", "DC2 URO", 
+                                  "DC3 Leuk-UTI", "DC3 Int-URO", "DC3 URO")) %>%
+  ggplot(aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-2.5, -1.8, -1.2, 1.2, 1.8, 2.5)),
+                    limits = c(-2.5, 2.5)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+```{r}
+ggsave("hallmark.png", p, width = 6, height = 5, units = c("in"), dpi=600)
+```
+
+## BTM
+
+For each cDC subset, top 10 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2_leukuti.btm <- arrange(gsa_dc2_leukuti.btm, pval)
+gsa_dc2_leukuti.btm_top <- gsa_dc2_leukuti.btm[1:10, ]
+
+gsa_dc2_inturo.btm <- arrange(gsa_dc2_inturo.btm, pval)
+gsa_dc2_inturo.btm_top <- gsa_dc2_inturo.btm[1:10, ]
+
+gsa_dc2_uro.btm <- arrange(gsa_dc2_uro.btm, pval)
+gsa_dc2_uro.btm_top <- gsa_dc2_uro.btm[1:10, ]
+
+gsa_dc3_leukuti.btm <- arrange(gsa_dc3_leukuti.btm, pval)
+gsa_dc3_leukuti.btm_top <- gsa_dc3_leukuti.btm[1:10, ] 
+
+gsa_dc3_inturo.btm <- arrange(gsa_dc3_inturo.btm, pval)
+gsa_dc3_inturo.btm_top <- gsa_dc3_inturo.btm[1:10, ]
+
+gsa_dc3_uro.btm <- arrange(gsa_dc3_uro.btm, pval)
+gsa_dc3_uro.btm_top <- gsa_dc3_uro.btm[1:10, ]
+
+pathways.btm <- rbind(gsa_dc2_leukuti.btm_top,
+                           gsa_dc2_inturo.btm_top, gsa_dc2_uro.btm_top, 
+                           gsa_dc3_leukuti.btm_top, gsa_dc3_inturo.btm_top,
+                           gsa_dc3_uro.btm_top)
+pathways.btm2 <- pathways.btm[!duplicated(pathways.btm$pathway),]
+pathways.btm2 <- pathways.btm2[, -c(2:8)]
+
+result_dc2_leukuti <- merge(pathways.btm2, gsa_dc2_leukuti.btm)
+result_dc2_leukuti$DC_subsets <- 'DC2 Leuk-UTI'
+result_dc2_leukuti$count <- -log10(result_dc2_leukuti$pval) 
+
+result_dc2_inturo <- merge(pathways.btm2, gsa_dc2_inturo.btm)
+result_dc2_inturo$DC_subsets <- 'DC2 Int-URO'
+result_dc2_inturo$count <- -log10(result_dc2_inturo$pval)
+
+result_dc2_uro <- merge(pathways.btm2, gsa_dc2_uro.btm)
+result_dc2_uro$DC_subsets <- 'DC2 URO'
+result_dc2_uro$count <- -log10(result_dc2_uro$pval)
+
+result_dc3_leukuti <- merge(pathways.btm2, gsa_dc3_leukuti.btm)
+result_dc3_leukuti$DC_subsets <- 'DC3 Leuk-UTI'
+result_dc3_leukuti$count <- -log10(result_dc3_leukuti$pval) 
+
+result_dc3_inturo <- merge(pathways.btm2, gsa_dc3_inturo.btm)
+result_dc3_inturo$DC_subsets <- 'DC3 Int-URO'
+result_dc3_inturo$count <- -log10(result_dc3_inturo$pval)
+
+result_dc3_uro <- merge(pathways.btm2, gsa_dc3_uro.btm)
+result_dc3_uro$DC_subsets <- 'DC3 URO'
+result_dc3_uro$count <- -log10(result_dc3_uro$pval)
+
+btm <- rbind(result_dc2_leukuti, result_dc2_inturo, result_dc2_uro, result_dc3_leukuti, result_dc3_inturo, result_dc3_uro)
+```
+
+```{r}
+order <- setDT(btm)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+btm <- merge(x = btm, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=5, fig.width=7}
+p <- btm %>%
+  mutate(DC_subsets = fct_relevel(DC_subsets, "DC2 Leuk-UTI", "DC2 Int-URO", "DC2 URO", 
+                                  "DC3 Leuk-UTI", "DC3 Int-URO", "DC3 URO")) %>%
+  ggplot(aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-3, -1.7, -1.2, 1.2, 1.7, 3)),
+                    limits = c(-3, 3)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+```{r}
+ggsave("btm.png", p, width = 7.5, height = 5, units = c("in"), dpi=600)
+```
+
+# Heatmaps with the leading edge genes of the inflammatory response pathway
+
+- Rows: GSEA leading edge genes of pathway of interest
+
+- Columns: samples aggregated by donor and cell type
+
+- Cells: Z-scores, log2 CPMs
+
+## DC2 Leuk-UTI vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc2[gsa_dc2_leukuti.hallmark[pathway == "HALLMARK_INFLAMMATORY_RESPONSE", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc2)), grep("Leuk-UTI", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 Leuk-UTI vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc3[gsa_dc3_leukuti.hallmark[pathway == "HALLMARK_INFLAMMATORY_RESPONSE", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc3)), grep("Leuk-UTI", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC2 INTURO vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc2[gsa_dc2_inturo.hallmark[pathway == "HALLMARK_INFLAMMATORY_RESPONSE", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc2)), grep("Int-URO", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 INTURO vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc3[gsa_dc3_inturo.hallmark[pathway == "HALLMARK_INFLAMMATORY_RESPONSE", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc3)), grep("Int-URO", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+# Heatmaps with the leading edge genes of the allograft rejection pathway
+
+## DC2 Leuk-UTI vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc2[gsa_dc2_leukuti.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc2)), grep("Leuk-UTI", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 Leuk-UTI vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc3[gsa_dc3_leukuti.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc3)), grep("Leuk-UTI", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC2 INTURO vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc2[gsa_dc2_inturo.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc2)), grep("Int-URO", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 INTURO vs healthy
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc3[gsa_dc3_inturo.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Control",colnames(mtx_dc3)), grep("Int-URO", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+# Direct comparison DC3 vs DC2 Int-URO vs Healthy
+
+Keep donors that belong to healthy or IntURO category and have at least 10 cells in DC2 and DC3.  
+
+```{r}
+sce_dc23_inturo_vs_healthy <- sce[, (sce$patient %in% c("4","5","8","9","12","13","14","16","17","19","26","30","38")) & (sce$dc %in% c("DC2", "DC3"))]
+```
+
+```{r}
+t(table(sce_dc23_inturo_vs_healthy$Cohort, sce_dc23_inturo_vs_healthy$patient))
+t(table(sce_dc23_inturo_vs_healthy$dc, sce_dc23_inturo_vs_healthy$patient))
+```
+## DEGs
+
+```{r}
+sce_dc23_inturo_vs_healthy$cluster_id <- factor(sce_dc23_inturo_vs_healthy$dc, levels = c("DC2","DC3"))
+sce_dc23_inturo_vs_healthy$group_id <- factor(sce_dc23_inturo_vs_healthy$Cohort, levels = c("Int-URO","Control"))
+sce_dc23_inturo_vs_healthy$sample_id <- factor(sce_dc23_inturo_vs_healthy$patient)
+
+sce_dc23_inturo_vs_healthy$cid_gid <- factor(paste(sce_dc23_inturo_vs_healthy$cluster_id, sce_dc23_inturo_vs_healthy$group_id, sep = "_"))
+
+dge_dc23_inturo_vs_healthy <- aggregateAcrossCells(sce_dc23_inturo_vs_healthy, id = colData(sce_dc23_inturo_vs_healthy)[, c("sample_id","cluster_id")])
+dge_dc23_inturo_vs_healthy <- calcNormFactors(dge_dc23_inturo_vs_healthy)
+
+mtx_dc23_inturo_vs_healthy <- t(scale(t(edgeR::cpm(dge_dc23_inturo_vs_healthy, log = T))))
+colnames(mtx_dc23_inturo_vs_healthy) <- paste(dge_dc23_inturo_vs_healthy$samples$cid_gid, dge_dc23_inturo_vs_healthy$samples$sample_id, sep = "_")
+
+dsn_dc23_inturo_vs_healthy <- model.matrix(~0+ sample_id, dge_dc23_inturo_vs_healthy$samples)
+dsn_dc23_inturo_vs_healthy <- cbind(
+    dsn_dc23_inturo_vs_healthy,
+    DC3_healthy = dge_dc23_inturo_vs_healthy$samples$cluster_id == "DC3" &
+      dge_dc23_inturo_vs_healthy$samples$group_id == "Control",
+    DC3_inturo = dge_dc23_inturo_vs_healthy$samples$cluster_id == "DC3" &
+      dge_dc23_inturo_vs_healthy$samples$group_id == "Int-URO"
+)
+
+dge_dc23_inturo_vs_healthy <- estimateDisp(dge_dc23_inturo_vs_healthy, dsn_dc23_inturo_vs_healthy)
+fit_dc23_inturo_vs_healthy <- glmQLFit(dge_dc23_inturo_vs_healthy, dsn_dc23_inturo_vs_healthy, robust = T)
+
+cts_dc23_inturo_vs_healthy <- makeContrasts(
+    healthy.DC3_vs_DC2 = DC3_healthy,
+    inturo.DC3_vs_DC2 = DC3_inturo,
+    inturo_vs_healthy.DC3_vs_DC2 = DC3_inturo - DC3_healthy,
+    levels = dsn_dc23_inturo_vs_healthy
+)
+
+res_dc23_inturo_vs_healthy <- 
+  glmQLFTest(fit_dc23_inturo_vs_healthy, 
+             contrast = cts_dc23_inturo_vs_healthy[, "inturo_vs_healthy.DC3_vs_DC2"]) %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc23_inturo_vs_healthy %>%
+    show_dt()
+```
+
+### Volcano plot
+
+```{r}
+res_dc23_inturo_vs_healthy$threshold<-"NoVariance"
+res_dc23_inturo_vs_healthy$threshold[res_dc23_inturo_vs_healthy$PValue < 0.05] <- c("-1 < FC < 1")
+res_dc23_inturo_vs_healthy$threshold[res_dc23_inturo_vs_healthy$PValue < 0.05 & res_dc23_inturo_vs_healthy$logFC > 1] <- c("FC > 1")
+res_dc23_inturo_vs_healthy$threshold[res_dc23_inturo_vs_healthy$PValue < 0.05 & res_dc23_inturo_vs_healthy$logFC < -1] <- c("FC < -1")
+```
+
+```{r}
+res_dc23_inturo_vs_healthy$threshold<-factor(res_dc23_inturo_vs_healthy$threshold)
+res_dc23_inturo_vs_healthy$threshold<-factor(res_dc23_inturo_vs_healthy$threshold, 
+                           levels(res_dc23_inturo_vs_healthy$threshold)[c(4,2,1,3)])
+```
+
+```{r}
+res_dc23_inturo_vs_healthy$labels <- ""
+res_dc23_inturo_vs_healthy$labels <- ifelse(res_dc23_inturo_vs_healthy$gene %in% c("RGCC","SENP5","SMC6","SERTAD3","MAD2L1BP")|(res_dc23_inturo_vs_healthy$logFC < -2.5 & 
+                             res_dc23_inturo_vs_healthy$PValue < 0.05), TRUE, FALSE)
+```
+
+```{r fig.height=4, fig.width=5.5}
+ggplot(data=res_dc23_inturo_vs_healthy, aes(x=logFC, y=-log10(PValue), colour=threshold)) +
+  geom_point(alpha=0.8, size=1.75) +
+  xlim(c(-6.2,6.2))+
+  ylim(c(0, 5)) +
+  xlab("log2 Fold Change") + ylab("-log10(p-value)") +
+  scale_color_manual(values=c("darkgrey","blue","lightgrey", "red")) +
+  geom_vline(xintercept = -1,colour="blue", linetype = "longdash") +
+  geom_vline(xintercept = 1,colour="red", linetype = "longdash") +
+  geom_hline(yintercept = -log10(0.05),colour="blue", linetype = "longdash") +
+  geom_text_repel(aes(label=ifelse(labels == TRUE,gene,"")), size=3.5) +
+  theme(panel.grid.major = element_line(colour = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(fill = NA, colour = "black", size = 1),
+        legend.position = "none", legend.key = element_blank())
+```
