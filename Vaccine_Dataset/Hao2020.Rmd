@@ -1,0 +1,666 @@
+---
+title: "Hao et al. 2020 dataset"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output:
+    html_notebook:
+        self_contained: true
+        df_print: paged
+        fig_height: 6
+        fig_width: 6
+        highlight: zenburn
+        theme: cosmo
+        number_sections: yes
+        toc: yes
+        toc_depth: 6
+        toc_float:
+            collapsed: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(DropletUtils)
+library(devtools)
+library(Seurat)
+library(SeuratDisk)
+library(patchwork)
+library(DT)
+library(fgsea)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(future)
+library(scater)
+library(edgeR)
+library(gghighlight)
+library(ggrepel)
+library(data.table)
+library(magrittr)
+library(ggpubr)
+library(scales)
+library(dendsort)
+
+show_dt <- function(df) { 
+    DT::datatable(
+        df,
+        class = "cell-border stripe",
+        rownames = TRUE,
+        escape = FALSE,
+        caption = NULL,
+        editable = FALSE,
+        filter = list(position = "top"),
+        extensions = c('Buttons', 'Scroller'),
+        options = list(
+            dom = 'Blfrtip',
+            scrollX = T,
+            scrollY = 500,
+            buttons = c('copy', 'csv', 'print'),
+            deferRender = TRUE,
+            scroller = TRUE
+        )
+    )
+}
+
+theme_set(theme_classic(14))
+```
+
+```{r}
+gmt.hallmark <- gmtPathways("h.all.v7.2.symbols.gmt")
+gmt.btm <- gmtPathways("BTMgenesets.gmt")
+```
+
+[Link](https://www.biorxiv.org/content/10.1101/2020.10.12.335331v1) to original PBMC CITE-seq dataset.
+
+# Load data and retain only cDC and Mono subsets as defined by the authors
+
+```{r}
+ref <- LoadH5Seurat("multi.h5seurat") %>% subset(subset = celltype.l3 %in% c("CD14 Mono", "CD16 Mono", "cDC1", "cDC2_1", "cDC2_2", "ASDC_mDC"))
+```
+
+## Exploratory plots
+
+### UMAP by time point
+
+Time point 0 is untreated, time points 3 and 7 (days) are post-HIV vaccine.
+
+```{r fig.height=4, fig.width=6}
+DimPlot(ref, reduction = "wnn.umap", group.by = "celltype.l3", split.by = "time", label = T, repel = T) + NoLegend()
+```
+### Violin plot for protein and gene markers at day 0
+
+Markers with `adt` prefix are antibodies, markers with `sct` prefix are RNA.
+
+```{r fig.height=11, fig.width=10}
+VlnPlot(subset(ref, time == 0), group.by = "celltype.l3", features = c("sct_FCER1A","adt_HLA-DR","sct_HLA-DRB1",
+"adt_CD1c", "sct_CD1C", "sct_CLEC10A", "adt_CD14", "sct_CD14", "adt_CD163", "sct_CD163", "adt_CD135", "sct_S100A8", "sct_S100A9", "sct_VCAN", "sct_CLEC4E", "sct_C5AR1"), pt.size = 0, ncol = 4)
+```
+
+cDC2_1 are DC3, cDC2_2 are DC2.
+
+```{r}
+cdc <- subset(ref, subset = celltype.l3 %in% c("cDC1","cDC2_1","cDC2_2"))
+```
+
+```{r}
+cdc$clusters <- ifelse(    
+    cdc$celltype.l3 %in% "cDC1", "1", ifelse(
+    cdc$celltype.l3 %in% "cDC2_2", "2", "3"
+    ))
+```
+
+```{r fig.height=3, fig.width=5}
+DimPlot(cdc, reduction = "wnn.umap", group.by = "clusters", split.by = "time", label = T, repel = T, cols = c('1' = '#ED68ED', '3' = '#00A9FF', '2' = '#0CB702')) + NoLegend()
+```
+```{r fig.height=5, fig.width=6}
+VlnPlot(cdc, group.by = "clusters", features = c("HLA-DRB1", "CLEC10A", "CLEC9A","CD14", "CD163", "S100A8"), pt.size = 0, ncol = 3, cols = c('1' = '#ED68ED', '3' = '#00A9FF', '2' = '#0CB702'))
+```
+# Pseudobulk differential analysis 
+
+Aggregate DCs by type and donor, then run differential test on aggregated counts. This ensures that the unit of independent replication is the sample (donor), not the cell.
+
+```{r}
+cdc$dc <- ifelse(
+    cdc$celltype.l3 %in% "cDC1", "DC1", ifelse(
+    cdc$celltype.l3 %in% "cDC2_2", "DC2", "DC3"
+))
+```
+
+```{r}
+saveRDS(cdc, file = "mdc_vaccine.rds")
+```
+
+```{r}
+sce_cdc <- as.SingleCellExperiment(cdc, assay = "SCT")
+sce_cdc <- sce_cdc[rowSums(counts(sce_cdc) > 1) >= 10, ]
+```
+
+```{r}
+t(table(sce_cdc$dc, sce_cdc$donor))
+t(table(sce_cdc$dc, sce_cdc$orig.ident))
+```
+## DC2
+
+### Day 3 vs Day 0
+
+#### DEGs
+
+```{r}
+sce_dc2 <- sce_cdc[, (sce_cdc$dc %in% "DC2")]
+```
+
+```{r}
+sce_dc2$group_id <- factor(sce_dc2$time, levels = c('0','3','7'))
+sce_dc2$donor_id <- factor(sce_dc2$donor)
+sce_dc2$sample_id <- factor(sce_dc2$orig.ident)
+
+dge_dc2 <- aggregateAcrossCells(sce_dc2, id = colData(sce_dc2)[, c("sample_id")])
+dge_dc2 <- calcNormFactors(dge_dc2)
+
+mtx_dc2 <- t(scale(t(edgeR::cpm(dge_dc2, log = T))))
+colnames(mtx_dc2) <- dge_dc2$samples$sample_id
+
+dsn_dc2 <- model.matrix(~ donor_id+group_id, dge_dc2$samples)
+dge_dc2 <- estimateDisp(dge_dc2, dsn_dc2)
+fit_dc2 <- glmQLFit(dge_dc2, dsn_dc2, robust = T)
+
+res_dc2_3days <- glmQLFTest(fit_dc2, coef = "group_id3") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2_3days %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc2_3days <- setNames(-log10(res_dc2_3days$PValue) * sign(res_dc2_3days$logFC), res_dc2_3days$gene)
+gsa_dc2_3days.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2_3days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_3days.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM 
+
+```{r}
+gsa_dc2_3days.btm <- fgseaMultilevel(gmt.btm, rnk_dc2_3days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_3days.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+### Day 7 vs Day 0
+
+#### DEGs
+
+```{r}
+res_dc2_7days <- glmQLFTest(fit_dc2, coef = "group_id7") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2_7days %>%
+    show_dt()
+```
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc2_7days <- setNames(-log10(res_dc2_7days$PValue) * sign(res_dc2_7days$logFC), res_dc2_7days$gene)
+gsa_dc2_7days.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2_7days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_7days.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+#### GSEA with BTM
+
+```{r}
+gsa_dc2_7days.btm <- fgseaMultilevel(gmt.btm, rnk_dc2_7days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2_7days.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+## DC3
+
+### Day 3 vs Day 0
+
+Remove donor P3 because DC3 number in P3_0 is < 10. 
+
+#### DEGs
+
+```{r}
+sce_dc3 <- sce_cdc[, (!sce_cdc$donor == "P3") & (sce_cdc$dc %in% "DC3")]
+```
+
+```{r}
+sce_dc3$group_id <- factor(sce_dc3$time, levels = c("0","3","7"))
+sce_dc3$donor_id <- factor(sce_dc3$donor)
+sce_dc3$sample_id <- factor(sce_dc3$orig.ident)
+
+dge_dc3 <- aggregateAcrossCells(sce_dc3, id = colData(sce_dc3)[, c("sample_id")])
+dge_dc3 <- calcNormFactors(dge_dc3)
+
+mtx_dc3 <- t(scale(t(edgeR::cpm(dge_dc3, log = T))))
+colnames(mtx_dc3) <- dge_dc3$samples$sample_id
+
+dsn_dc3 <- model.matrix(~donor_id+group_id, dge_dc3$samples)
+dge_dc3 <- estimateDisp(dge_dc3, dsn_dc3)
+fit_dc3 <- glmQLFit(dge_dc3, dsn_dc3, robust = T)
+
+res_dc3_3days <- glmQLFTest(fit_dc3, coef = "group_id3") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3_3days %>%
+    show_dt()
+```
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc3_3days <- setNames(-log10(res_dc3_3days$PValue) * sign(res_dc3_3days$logFC), res_dc3_3days$gene)
+gsa_dc3_3days.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3_3days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_3days.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM
+
+```{r}
+gsa_dc3_3days.btm <- fgseaMultilevel(gmt.btm, rnk_dc3_3days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_3days.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+### Day 7 vs Day 0
+
+#### DEGs
+
+```{r}
+res_dc3_7days <- glmQLFTest(fit_dc3, coef = "group_id7") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3_7days %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark 
+
+```{r}
+rnk_dc3_7days <- setNames(-log10(res_dc3_7days$PValue) * sign(res_dc3_7days$logFC), res_dc3_7days$gene)
+gsa_dc3_7days.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3_7days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_7days.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+#### GSEA with BTM
+
+```{r}
+gsa_dc3_7days.btm <- fgseaMultilevel(gmt.btm, rnk_dc3_7days, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3_7days.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+# Heatmap with top 100 DEGs for DC2 and DC3
+
+Rows: Top 100 DEGs for DC2 or DC3 in vaccinated vs unvaccinated donors
+
+Columns: samples aggregated by donor and cell type
+
+Cells: Z-scores, log2 CPMs
+
+Remove RP genes.
+
+## DC2
+
+### Day 3 vs day 0
+
+```{r}
+genes_dc2_3days <- arrange(res_dc2_3days, PValue)
+genes_dc2_3days <- genes_dc2_3days[!grepl("^RP[LS]",genes_dc2_3days$gene),]
+genes_dc2_3days_top100 <- genes_dc2_3days[1:100, 1]
+
+mtx_dc2.df <- as.data.frame(mtx_dc2)
+mtx_dc2.df$gene <- row.names(mtx_dc2.df)
+
+mtx_dc2_3days.df_top100 <- merge(genes_dc2_3days_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2_3days.df_top100) <- mtx_dc2_3days.df_top100$gene
+mtx_dc2_3days.df_top100$gene <- NULL
+mtx_dc2_3days.df_top100 <- mtx_dc2_3days.df_top100[,c(1,4,7,10,13,16,19,22,2,5,8,11,14,17,20,23)]
+```
+
+```{r fig.height=8, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc2_3days.df_top100), method="ward.D2"), isReverse = TRUE)
+
+mtx_dc2_3days.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### Day 7 vs day 0
+
+```{r}
+genes_dc2_7days <- arrange(res_dc2_7days, PValue)
+genes_dc2_7days <- genes_dc2_7days[!grepl("^RP[LS]",genes_dc2_7days$gene),]
+genes_dc2_7days_top100 <- genes_dc2_7days[1:100, 1]
+
+mtx_dc2_7days.df_top100 <- merge(genes_dc2_7days_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2_7days.df_top100) <- mtx_dc2_7days.df_top100$gene
+mtx_dc2_7days.df_top100$gene <- NULL
+mtx_dc2_7days.df_top100 <- mtx_dc2_7days.df_top100[,c(1,4,7,10,13,16,19,22,3,6,9,12,15,18,21,24)]
+```
+
+```{r fig.height=10, fig.width=4}
+dend <- dendsort(hclust(dist(mtx_dc2_7days.df_top100), method="ward.D2"), isReverse = TRUE)
+
+mtx_dc2_7days.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3
+
+### Day 3 vs day 0
+
+```{r}
+genes_dc3_3days <- arrange(res_dc3_3days, PValue)
+genes_dc3_3days <- genes_dc3_3days[!grepl("^RP[LS]",genes_dc3_3days$gene),]
+genes_dc3_3days_top100 <- genes_dc3_3days[1:100, 1]
+
+mtx_dc3.df <- as.data.frame(mtx_dc3)
+mtx_dc3.df$gene <- row.names(mtx_dc3.df)
+
+mtx_dc3_3days.df_top100 <- merge(genes_dc3_3days_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3_3days.df_top100) <- mtx_dc3_3days.df_top100$gene
+mtx_dc3_3days.df_top100$gene <- NULL
+mtx_dc3_3days.df_top100 <- mtx_dc3_3days.df_top100[,c(1,4,7,10,13,16,19,2,5,8,11,14,17,20)]
+```
+
+```{r fig.height=8, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc3_3days.df_top100), method="ward.D2"), isReverse = F)
+
+mtx_dc3_3days.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+### Day 7 vs day 0
+
+```{r}
+genes_dc3_7days <- arrange(res_dc3_7days, PValue)
+genes_dc3_7days <- genes_dc3_7days[!grepl("^RP[LS]",genes_dc3_7days$gene),]
+genes_dc3_7days_top100 <- genes_dc3_7days[1:100, 1]
+
+mtx_dc3_7days.df_top100 <- merge(genes_dc3_7days_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3_7days.df_top100) <- mtx_dc3_7days.df_top100$gene
+mtx_dc3_7days.df_top100$gene <- NULL
+mtx_dc3_7days.df_top100 <- mtx_dc3_7days.df_top100[,c(1,4,7,10,13,16,19,3,6,9,12,15,18,21)]
+```
+
+```{r fig.height=10, fig.width=4}
+dend <- dendsort(hclust(dist(mtx_dc3_7days.df_top100), method="ward.D2"), isReverse = TRUE)
+
+mtx_dc3_7days.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+# Pathway enrichment visualization
+
+## Hallmark
+
+For each cDC subset, top 10 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2_3days.hallmark <- arrange(gsa_dc2_3days.hallmark, pval)
+gsa_dc2_3days.hallmark_top <- gsa_dc2_3days.hallmark[1:10, ]
+
+gsa_dc2_7days.hallmark <- arrange(gsa_dc2_7days.hallmark, pval)
+gsa_dc2_7days.hallmark_top <- gsa_dc2_7days.hallmark[1:10, ]
+
+gsa_dc3_3days.hallmark <- arrange(gsa_dc3_3days.hallmark, pval)
+gsa_dc3_3days.hallmark_top <- gsa_dc3_3days.hallmark[1:10, ] 
+
+gsa_dc3_7days.hallmark <- arrange(gsa_dc3_7days.hallmark, pval)
+gsa_dc3_7days.hallmark_top <- gsa_dc3_7days.hallmark[1:10, ]
+
+pathways.hallmark <- rbind(gsa_dc2_3days.hallmark_top, gsa_dc2_7days.hallmark_top, 
+                           gsa_dc3_3days.hallmark_top, gsa_dc3_7days.hallmark_top)
+pathways.hallmark2 <- pathways.hallmark[!duplicated(pathways.hallmark$pathway),]
+pathways.hallmark2 <- pathways.hallmark2[, -c(2:8)]
+
+result_dc2_3days <- merge(pathways.hallmark2, gsa_dc2_3days.hallmark)
+result_dc2_3days$DC_subsets <- 'DC2 Day 3'
+result_dc2_3days$count <- -log10(result_dc2_3days$pval) 
+
+result_dc2_7days <- merge(pathways.hallmark2, gsa_dc2_7days.hallmark)
+result_dc2_7days$DC_subsets <- 'DC2 Day 7'
+result_dc2_7days$count <- -log10(result_dc2_7days$pval)
+
+result_dc3_3days <- merge(pathways.hallmark2, gsa_dc3_3days.hallmark)
+result_dc3_3days$DC_subsets <- 'DC3 Day 3'
+result_dc3_3days$count <- -log10(result_dc3_3days$pval) 
+
+result_dc3_7days <- merge(pathways.hallmark2, gsa_dc3_7days.hallmark)
+result_dc3_7days$DC_subsets <- 'DC3 Day 7'
+result_dc3_7days$count <- -log10(result_dc3_7days$pval)
+
+hallmark <- rbind(result_dc2_3days, result_dc2_7days, result_dc3_3days, result_dc3_7days)
+```
+
+```{r}
+hallmark$pathway <- gsub('HALLMARK_', '', hallmark$pathway)
+hallmark$pathway <- gsub('_', ' ', hallmark$pathway)
+```
+
+```{r}
+order <- setDT(hallmark)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+hallmark <- merge(x = hallmark, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=5, fig.width=5.5}
+p <- ggplot(hallmark, aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-2.5, -1.5, -1.2, 1.2, 1.5, 2.5)),
+                    limits = c(-2.5, 2.5)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+
+```{r}
+ggsave("hallmark.pdf", p, width = 6, height = 5, units = c("in"), dpi=600)
+```
+
+## BTM
+
+For each cDC subset, top 10 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2_3days.btm <- arrange(gsa_dc2_3days.btm, pval)
+gsa_dc2_3days.btm_top <- gsa_dc2_3days.btm[1:10, ]
+
+gsa_dc2_7days.btm <- arrange(gsa_dc2_7days.btm, pval)
+gsa_dc2_7days.btm_top <- gsa_dc2_7days.btm[1:10, ]
+
+gsa_dc3_3days.btm <- arrange(gsa_dc3_3days.btm, pval)
+gsa_dc3_3days.btm_top <- gsa_dc3_3days.btm[1:10, ] 
+
+gsa_dc3_7days.btm <- arrange(gsa_dc3_7days.btm, pval)
+gsa_dc3_7days.btm_top <- gsa_dc3_7days.btm[1:10, ]
+
+pathways.btm <- rbind(gsa_dc2_3days.btm_top, gsa_dc2_7days.btm_top, 
+                           gsa_dc3_3days.btm_top, gsa_dc3_7days.btm_top)
+pathways.btm2 <- pathways.btm[!duplicated(pathways.btm$pathway),]
+pathways.btm2 <- pathways.btm2[, -c(2:8)]
+
+result_dc2_3days <- merge(pathways.btm2, gsa_dc2_3days.btm)
+result_dc2_3days$DC_subsets <- 'DC2 Day 3'
+result_dc2_3days$count <- -log10(result_dc2_3days$pval) 
+
+result_dc2_7days <- merge(pathways.btm2, gsa_dc2_7days.btm)
+result_dc2_7days$DC_subsets <- 'DC2 Day 7'
+result_dc2_7days$count <- -log10(result_dc2_7days$pval)
+
+result_dc3_3days <- merge(pathways.btm2, gsa_dc3_3days.btm)
+result_dc3_3days$DC_subsets <- 'DC3 Day 3'
+result_dc3_3days$count <- -log10(result_dc3_3days$pval) 
+
+result_dc3_7days <- merge(pathways.btm2, gsa_dc3_7days.btm)
+result_dc3_7days$DC_subsets <- 'DC3 Day 7'
+result_dc3_7days$count <- -log10(result_dc3_7days$pval)
+
+btm <- rbind(result_dc2_3days, result_dc2_7days, result_dc3_3days, result_dc3_7days)
+```
+
+```{r}
+order <- setDT(btm)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+btm <- merge(x = btm, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=4.5, fig.width=7}
+p <- ggplot(btm, aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-3, -1.8, -1.2, 1.2, 1.8, 3)),
+                    limits = c(-3, 3)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+```{r}
+ggsave("btm.pdf", p, width = 7.5, height = 4.5, units = c("in"), dpi=600)
+```
+
+# Heatmaps with the leading edge genes of the allograft rejection pathway 
+
+Rows: GSEA leading edge genes of pathway of interest
+
+Columns: samples aggregated by donor and cell type
+
+Cells: Z-scores, log2 CPMs
+
+## DC2 day 3 vs day 0
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc2[gsa_dc2_3days.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("_0",colnames(mtx_dc2)), grep("_3", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 day 3 vs day 0
+
+```{r fig.height=4.5, fig.width=3}
+mtx_dc3[gsa_dc3_3days.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("_0",colnames(mtx_dc3)), grep("_3", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+
