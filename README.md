@@ -1,3 +1,5 @@
 # DC_COVID19
 
-This repository supports the manuscript “Maturation signatures of conventional dendritic cell subtypes in COVID-19 reflect direct viral sensing” currently available in [bioRxiv](https://www.biorxiv.org/content/10.1101/2021.03.03.433597v2). The code will be pushed upon manuscript acceptance for publication.
+This repository hosts the code to reproduce the results from "Maturation signatures of conventional dendritic cell subtypes in COVID-19 suggest direct viral sensing", published in the European Journal of Immunology on 2021-08-XX, [DOI: 10.1002/eji.202149298](https://doi.org/10.1002/eji.202149298).
+
+Analyses are organized in R notebooks/folders matching the investigated single-cell datasets: 1) COVID-19 dataset 1 (this study), 2) COVID-19 dataset 2 ([Arunachalam et al. 2020]( https://science.sciencemag.org/content/sci/369/6508/1210.full.pdf)), 3) COVID-19 dataset 3 ([Schulte-Schrepping et al. 2020](https://www.cell.com/action/showPdf?pii=S0092-8674%2820%2930992-2)), 4) bacterial infection dataset ([Reyes et al. 2020](https://www.nature.com/articles/s41591-020-0752-4)), 5) vaccine dataset ([Hao et al. 2020]( https://www.cell.com/cell/fulltext/S0092-8674(21)00583-3?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS0092867421005833%3Fshowall%3Dtrue)), 6) integration of the 3 COVID-19 datasets. 
