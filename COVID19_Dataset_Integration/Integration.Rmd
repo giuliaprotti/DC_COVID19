@@ -1,0 +1,725 @@
+---
+title: "Integration among the three COVID-19 datasets"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output:
+    html_notebook:
+        self_contained: true
+        df_print: paged
+        fig_height: 6
+        fig_width: 6
+        highlight: zenburn
+        theme: cosmo
+        number_sections: yes
+        toc: yes
+        toc_depth: 6
+        toc_float:
+            collapsed: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(DropletUtils)
+library(Seurat)
+library(SeuratWrappers)
+library(harmony)
+library(future)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(scater)
+library(edgeR)
+library(gghighlight)
+library(ggrepel)
+library(data.table)
+library(ggpubr)
+library(scales)
+library(fgsea)
+library(dendsort)
+
+theme_set(theme_classic(14))
+
+show_dt <- function(df) { 
+    DT::datatable(
+        df,
+        class = "cell-border stripe",
+        rownames = TRUE,
+        escape = FALSE,
+        caption = NULL,
+        editable = FALSE,
+        filter = list(position = "top"),
+        extensions = c('Buttons', 'FixedColumns', 'Scroller'),
+        options = list(
+            dom = 'Blfrtip',
+            scrollX = F,
+            scrollY = 500,
+            buttons = c('copy', 'csv', 'print'),
+            fixedColumns = TRUE,
+            deferRender = TRUE,
+            scroller = TRUE
+        )
+    )
+}
+```
+
+# Load data with cDCs identified in the three COVID-19 datasets
+
+```{r}
+dataset1 <- readRDS("mdc_dataset1.rds")
+dataset2 <- readRDS("mdc_dataset2.rds")
+dataset3 <- readRDS("mdc_dataset3.rds")
+```
+
+```{r}
+dataset1$condition <- ifelse(dataset1$Sample == 'Covid_1', 'Severe', ifelse(dataset1$Sample %in% c('Covid_2','Covid_3'), 'Mild', 'Healthy'))
+dataset1$origin <- 'Dataset 1'
+dataset1$patient_id <- paste(dataset1$Sample, 'D1', sep='_')
+```
+
+```{r}
+dataset2$condition <- ifelse(dataset2$patient_id %in% c('cov01','cov04','cov10','cov11'), 'Severe', ifelse(dataset2$patient_id %in% c('cov02','cov03','cov12'), 'Mild', 'Healthy'))
+dataset2$origin <- 'Dataset 2'
+dataset2$patient_id <- paste(dataset2$patient_id, 'D2', sep='_')
+```
+
+```{r}
+dataset3 <- subset(dataset3, subset=orig.ident == 'Covid19') # For dataset 3, keep only COVID19 samples
+dataset3$condition <- ifelse(dataset3$group_per_sample == 'severe', 'Severe', 'Mild')
+dataset3$origin <- 'Dataset 3'
+dataset3$patient_id <- paste(dataset3$donor, 'D3', sep='_')
+```
+
+# Merge datasets
+
+```{r}
+merged <- merge(dataset1, y=c(dataset2,dataset3), add.cell.ids = c("Dataset1","Dataset2","Dataset3"), project = "cDCs_merged") 
+
+merged <- PercentageFeatureSet(merged, features = grep("^MT\\-", rownames(merged), value = T), col.name = "percent.mt")
+
+VlnPlot(merged, assay = "RNA", slot = "counts", features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), group.by = "origin", same.y.lims = F, log = F, pt.size = 0, ncol = 3)
+```
+```{r}
+merged <- subset(merged, subset = nFeature_RNA >= 500 & percent.mt < 10)
+```
+
+```{r}
+dim(merged)
+```
+```{r message=FALSE, warning=FALSE}
+merged <- SCTransform(merged, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA","percent.mt"), variable.features.n = 100, return.only.var.genes = F, conserve.memory = F, seed.use = 123) 
+merged <- RunPCA(merged, assay = "SCT", npcs = 50)
+```
+
+```{r fig.height=4, fig.width=6}
+ElbowPlot(merged)
+```
+```{r}
+merged <- RunHarmony(merged, assay.use = "SCT", group.by.vars = c("origin","condition"), reduction = "pca", dims.use = 1:10)
+merged <- RunUMAP(merged, reduction = "harmony", dims = 1:10, seed.use = 42)
+merged <- FindNeighbors(merged, dims = 1:10, reduction = "harmony", force.recalc = TRUE)
+```
+
+```{r}
+merged <- FindClusters(merged, algorithm = 1, resolution = 0.8, random.seed = 1)
+```
+
+```{r fig.height=4, fig.width=8}
+p1 <- DimPlot(merged, reduction = "umap", group.by = c("origin"),  label = F) 
+p2 <- DimPlot(merged, reduction = "umap", group.by = c("condition"), label = F, cols = c('#E8867D','#E3BE4C','#D85543'))
+
+p1|p2
+```
+```{r fig.height=4, fig.width=3}
+DimPlot(merged, reduction = "umap", group.by = c("seurat_clusters"), 
+        cols = c('9' = '#ED68ED','1' = '#00A9FF', '5' = '#8494FF', '10'='#43BED8','11'='#1667EF',
+                 '2' = '#7CAE00', '3' = '#0CB702', '0' = '#0DB423','4' = '#55D112', 
+                 '6' = '#04B927','7' = '#61D843','8' = '#43D86D', '12' = '#1BAD44'), label = T) + NoLegend()
+```
+# Identification of DC subsets
+
+```{r fig.height=10, fig.width=10}
+FeaturePlot(merged, reduction = "umap", features = c("CLEC9A","XCR1","CD1C","CLEC10A","FCER1A","CD163","CD14","S100A8","HLA-DRB1"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol = 3)
+```
+```{r fig.height=5, fig.width=7}
+VlnPlot(merged, features = c("HLA-DRB1", "CLEC10A", "CLEC9A", "CD14", "CD163","S100A8"), pt.size = 0, ncol = 3, cols = c('9' = '#ED68ED','1' = '#00A9FF', '5' = '#8494FF', '10'='#43BED8','11'='#1667EF',
+                 '2' = '#7CAE00', '3' = '#0CB702', '0' = '#0DB423','4' = '#55D112', '6' = '#04B927',
+                 '7' = '#61D843','8' = '#43D86D', '12' = '#1BAD44'))
+```
+```{r fig.height=4.5, fig.width=5}
+DotPlot(merged, features = c("HLA-DRB1", "CLEC10A", "CLEC9A", "CD14", "CD163","S100A8"), 
+        cols = c("lightgrey", "darkgreen"), cluster.idents = T) + RotatedAxis()
+```
+```{r}
+merged$dc <- ifelse(
+    merged$seurat_clusters %in% c(1,5,10,11), "DC3", ifelse(
+        merged$seurat_clusters %in% c(9), "cDC1", "DC2"
+))
+```
+
+## cDC proportions 
+
+```{r}
+x <- merged[[]]
+x <- x[, c('patient_id','condition')]
+x <- x[!duplicated(x$patient_id), ]
+
+pt <- table(merged$dc, merged$patient_id)
+pt <- as.data.frame(pt)
+pt <- merge(pt, x, by.x= "Var2", by.y= "patient_id")
+pt <- pt %>% 
+  group_by(Var2) %>% 
+  mutate(pct=prop.table(Freq))
+```
+
+```{r fig.height=3.5, fig.width=5}
+ggbarplot(pt, x = "Var1", y = "pct", 
+          fill = 'condition',
+          palette = c('#E8867D','#E3BE4C','#D85543'),
+          add = c("mean_se"),
+          position = position_dodge(0.8),
+          legend='right')
+```
+```{r fig.height=3, fig.width=3.5}
+ggplot(pt, aes(x = condition, y = pct, fill = Var1)) +
+  theme_classic(base_size = 12) +
+  geom_col(position = "fill", width = 0.8) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values =c('#ED68ED','#47B26E','#24C4D2')) +
+  theme(legend.title = element_blank())
+```
+# Re-clustering of DC3 
+
+```{r}
+dc3 <- subset(merged, subset=dc=='DC3')
+```
+
+```{r message=FALSE, warning=FALSE}
+dc3 <- SCTransform(dc3, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA","percent.mt"), variable.features.n = 100, return.only.var.genes = F, conserve.memory = F, seed.use = 123) 
+dc3 <- RunPCA(dc3, assay = "SCT", npcs = 50) 
+```
+
+```{r fig.height=4, fig.width=6}
+ElbowPlot(dc3, ndims = 30)
+```
+```{r}
+dc3 <- RunHarmony(dc3, assay.use = "SCT", group.by.vars = c("origin", "condition"), reduction = "pca", dims.use = 1:30)
+dc3 <- RunUMAP(dc3, reduction = "harmony", dims = 1:30, seed.use = 42)
+dc3 <- FindNeighbors(dc3, dims = 1:30, reduction = "harmony", force.recalc = TRUE)
+dc3 <- FindClusters(dc3, algorithm = 1, resolution = 0.6, random.seed = 1)
+```
+
+```{r}
+dim(dc3)
+```
+```{r fig.height=4, fig.width=3.5}
+DimPlot(dc3, reduction = "umap", group.by = 'seurat_clusters', label = T, 
+        cols = c('0' = '#BBA8A8', '2' = '#9C9595', '1' = '#C6CCC7', '3' ='#E1E1E1','4' = '#B1B3B0')) + NoLegend()
+```
+```{r fig.height=3, fig.width=4}
+DotPlot(dc3, features = c("CD14", "CD163"), 
+        cols = c("lightgrey", "darkgreen"), cluster.idents = T) + RotatedAxis()
+```
+```{r}
+dc3$annotation <- ifelse(
+    dc3$seurat_clusters %in% c(1,3,4), "CD14low CD163low", "CD14+ CD163+")
+```
+
+## DC3 proportions
+
+```{r}
+x <- dc3[[]]
+x <- x[, c('patient_id','condition')]
+x <- x[!duplicated(x$patient_id), ]
+
+pt <- table(dc3$annotation, dc3$patient_id)
+pt <- as.data.frame(pt)
+pt <- merge(pt, x, by.x= "Var2", by.y= "patient_id")
+pt <- pt %>% 
+  group_by(Var2) %>% 
+  mutate(pct=prop.table(Freq))
+
+pt$disease <- ifelse(pt$condition %in% c('Mild','Severe'), 'COVID-19','HD')
+```
+
+```{r fig.height=3, fig.width=4}
+ggplot(pt, aes(x = factor(disease,levels=c('HD','COVID-19')), y = pct, fill = factor(Var1, levels=c('CD14low CD163low', 'CD14+ CD163+')))) +
+  theme_classic(base_size = 12) +
+  geom_col(position = "fill", width = 0.8) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values =c('#C6CCC7','#BBA8A8')) +
+  theme(legend.title = element_blank())
+```
+# Direct comparison COVID19 vs Healthy DC3 vs DC2 
+
+## DEGs
+
+Remove donors with less than 10 cells in DC2 or DC3.
+
+```{r}
+sce <- as.SingleCellExperiment(merged, assay = "SCT")
+sce <- sce[rowSums(counts(sce) > 2) >= 10, ]
+```
+
+```{r}
+t(table(sce$dc, sce$patient_id))
+t(table(sce$disease, sce$patient_id))
+```
+```{r}
+sce_dc23 <- sce[, (sce$patient_id %in% c('C19-CB-0001_D3','C19-CB-0002_D3','C19-CB-0003_D3','C19-CB-0009_D3','cov01_D2','cov03_D2','cov07_D2','cov08_D2','cov09_D2','cov11_D2','cov12_D2','cov17_D2','cov18_D2','Covid_2_D1','Covid_3_D1','HD_1_D1','HD_2_D1')) & (!sce$dc == "cDC1")]
+t(table(sce_dc23$dc, sce_dc23$patient_id))
+```
+```{r}
+sce_dc23$cluster_id <- factor(sce_dc23$dc, levels = c("DC2","DC3"))
+sce_dc23$group_id <- factor(sce_dc23$disease, levels = c("covid","healthy"))
+sce_dc23$sample_id <- factor(sce_dc23$patient_id)
+
+levels(sce_dc23$sample_id)[levels(sce_dc23$sample_id)=="C19-CB-0001_D3"] <- "C19_CB_0001_D3"
+levels(sce_dc23$sample_id)[levels(sce_dc23$sample_id)=="C19-CB-0002_D3"] <- 'C19_CB_0002_D3'
+levels(sce_dc23$sample_id)[levels(sce_dc23$sample_id)=="C19-CB-0003_D3"] <- 'C19_CB_0003_D3'
+levels(sce_dc23$sample_id)[levels(sce_dc23$sample_id)=="C19-CB-0009_D3"] <- 'C19_CB_0009_D3'
+
+sce_dc23$cid_gid <- factor(paste(sce_dc23$cluster_id, sce_dc23$group_id, sep = "_"))
+
+dge_dc23 <- aggregateAcrossCells(sce_dc23, id = colData(sce_dc23)[, c("sample_id","cluster_id")])
+dge_dc23 <- calcNormFactors(dge_dc23)
+
+mtx_dc23 <- t(scale(t(edgeR::cpm(dge_dc23, log = T))))
+colnames(mtx_dc23) <- paste(dge_dc23$samples$cid_gid, dge_dc23$samples$sample_id, sep = "_")
+
+dsn_dc23 <- model.matrix(~ sample_id, dge_dc23$samples)
+dsn_dc23 <- cbind(
+    dsn_dc23,
+    DC3_healthy = dge_dc23$samples$cluster_id == "DC3" & dge_dc23$samples$group_id == "healthy",
+    DC3_covid = dge_dc23$samples$cluster_id == "DC3" & dge_dc23$samples$group_id == "covid"
+)
+
+dge_dc23 <- estimateDisp(dge_dc23, dsn_dc23)
+fit_dc23 <- glmQLFit(dge_dc23, dsn_dc23, robust = T)
+
+cts_dc23 <- makeContrasts(
+    healthy.DC3_vs_DC2 = DC3_healthy,
+    covid.DC3_vs_DC2 = DC3_covid,
+    covid_vs_healthy.DC3_vs_DC2 = DC3_covid - DC3_healthy,
+    levels = dsn_dc23
+)
+
+res_dc23 <- glmQLFTest(fit_dc23, contrast = cts_dc23[, "covid_vs_healthy.DC3_vs_DC2"]) %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc23 %>%
+    show_dt()
+```
+
+### Volcano plot 
+
+```{r}
+res_dc23$threshold <- "NoVariance"
+res_dc23$threshold[res_dc23$PValue < 0.05] <- c("-1 < FC < 1")
+res_dc23$threshold[res_dc23$PValue < 0.05 & res_dc23$logFC > 1] <- c("FC > 1")
+res_dc23$threshold[res_dc23$PValue < 0.05 & res_dc23$logFC < -1] <- c("FC < -1")
+```
+
+```{r}
+res_dc23$threshold<-factor(res_dc23$threshold)
+res_dc23$threshold<-factor(res_dc23$threshold, levels(res_dc23$threshold)[c(4,2,1,3)])
+
+res_dc23$labels <- with(res_dc23, ifelse(gene %in% c('CLU','AXL','C1QA','CD14')|logFC < -1.5 & PValue < 0.05, gene, ""))
+```
+
+```{r fig.height=4, fig.width=5.5}
+ggplot(data=res_dc23, aes(x=logFC, y=-log10(PValue), colour=threshold)) +
+  geom_point(alpha=0.8, size=1.75) +
+  xlim(c(-6.2,6.2))+
+  ylim(c(0, 5)) +
+  xlab("log2 Fold Change") + ylab("-log10(p-value)") +
+  scale_color_manual(values=c("darkgrey","blue","lightgrey", "red")) +
+  geom_vline(xintercept = -1,colour="blue", linetype = "longdash") +
+  geom_vline(xintercept = 1,colour="red", linetype = "longdash") +
+  geom_hline(yintercept = -log10(0.05),colour="blue", linetype = "longdash") +
+  geom_text_repel(aes(label=labels), size = 4) +
+  theme(panel.grid.major = element_line(colour = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(fill = NA, colour = "black", size = 1),
+        legend.position = "none", legend.key = element_blank(), axis.text = element_text(size=13))
+```
+# Severe vs Mild COVID-19 patients
+
+Aggregate DCs by type and donor, then run differential test on aggregated counts. This ensures that the unit of independent replication is the sample (donor), not the cell.
+
+```{r}
+t(table(sce$dc, sce$patient_id))
+t(table(sce$condition, sce$patient_id))
+```
+## DC2
+
+22 donors have more than 10 DC2s (7 HDs, 9 mild, 6 severe). 
+
+### DEGs: Severe vs Mild
+
+```{r}
+sce_dc2 <- sce[, (sce$patient_id %in% c('C19-CB-0001_D3','C19-CB-0002_D3','C19-CB-0003_D3','C19-CB-0009_D3','C19-CB-0021_D3','C19-CB-0198_D3','C19-CB-0204_D3','cov01_D2','cov02_D2','cov03_D2','cov04_D2','cov07_D2','cov08_D2','cov09_D2','cov11_D2','cov12_D2','cov17_D2','cov18_D2','Covid_2_D1','Covid_3_D1','HD_1_D1','HD_2_D1')) & (sce$dc == "DC2")]
+t(table(sce_dc2$condition, sce_dc2$patient_id))
+```
+```{r}
+sce_dc2$group_id <- factor(sce_dc2$condition, levels = c("Healthy", "Mild", "Severe"))
+sce_dc2$sample_id <- factor(sce_dc2$patient_id)
+sce_dc2$dataset <- factor(sce_dc2$origin)
+
+levels(sce_dc2$dataset)[levels(sce_dc2$dataset)=="Dataset 1"] <- "Dataset1"
+levels(sce_dc2$dataset)[levels(sce_dc2$dataset)=="Dataset 2"] <- "Dataset2"
+levels(sce_dc2$dataset)[levels(sce_dc2$dataset)=="Dataset 3"] <- "Dataset3"
+
+dge_dc2 <- aggregateAcrossCells(sce_dc2, id = colData(sce_dc2)[, c("sample_id")])
+dge_dc2 <- calcNormFactors(dge_dc2)
+
+mtx_dc2 <- t(scale(t(edgeR::cpm(dge_dc2, log = T))))
+
+dsn_dc2 <- model.matrix(~ dataset + group_id, dge_dc2$samples)
+dge_dc2 <- estimateDisp(dge_dc2, dsn_dc2)
+fit_dc2 <- glmQLFit(dge_dc2, dsn_dc2, robust = T)
+
+cts_dc2 <- makeContrasts(
+    DC2_severe_vs_mild = group_idSevere - group_idMild,
+    levels = dsn_dc2
+)
+
+res_dc2 <- glmQLFTest(fit_dc2, contrast = cts_dc2[, "DC2_severe_vs_mild"]) %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2 %>%
+    show_dt()
+```
+
+## DC3
+
+19 donors have more than 10 DC2s (7 HDs, 7 mild, 5 severe). 
+
+### DEGs: Severe vs Mild
+
+```{r}
+sce_dc3 <- sce[, (sce$patient_id %in% c('C19-CB-0001_D3','C19-CB-0002_D3','C19-CB-0003_D3',
+'C19-CB-0008_D3', 'C19-CB-0009_D3','cov01_D2','cov03_D2','cov07_D2','cov08_D2','cov09_D2','cov11_D2','cov12_D2','cov17_D2','cov18_D2','Covid_1_D1','Covid_2_D1', 'Covid_3_D1','HD_1_D1','HD_2_D1')) & (sce$dc == "DC3")]
+t(table(sce_dc3$condition, sce_dc3$patient_id))
+```
+```{r}
+sce_dc3$group_id <- factor(sce_dc3$condition, levels = c("Healthy", "Mild", "Severe"))
+sce_dc3$sample_id <- factor(sce_dc3$patient_id)
+sce_dc3$dataset <- factor(sce_dc3$origin)
+
+levels(sce_dc3$dataset)[levels(sce_dc3$dataset)=="Dataset 1"] <- "Dataset1"
+levels(sce_dc3$dataset)[levels(sce_dc3$dataset)=="Dataset 2"] <- "Dataset2"
+levels(sce_dc3$dataset)[levels(sce_dc3$dataset)=="Dataset 3"] <- "Dataset3"
+
+dge_dc3 <- aggregateAcrossCells(sce_dc3, id = colData(sce_dc3)[, c("sample_id")])
+dge_dc3 <- calcNormFactors(dge_dc3)
+
+mtx_dc3 <- t(scale(t(edgeR::cpm(dge_dc3, log = T))))
+
+dsn_dc3 <- model.matrix(~ dataset + group_id, dge_dc3$samples)
+dge_dc3 <- estimateDisp(dge_dc3, dsn_dc3)
+fit_dc3 <- glmQLFit(dge_dc3, dsn_dc3, robust = T)
+
+cts_dc3 <- makeContrasts(
+    DC3_severe_vs_mild = group_idSevere - group_idMild,
+    levels = dsn_dc3
+)
+
+res_dc3 <- glmQLFTest(fit_dc3, contrast = cts_dc3[, "DC3_severe_vs_mild"]) %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3 %>%
+    show_dt()
+```
+
+# Volcano plot Severe vs Mild in DC2 and DC3 
+
+## DC2 
+
+```{r}
+res_dc2$threshold <- "NoVariance"
+res_dc2$threshold[res_dc2$PValue < 0.05] <- c("-1 < FC < 1")
+res_dc2$threshold[res_dc2$PValue < 0.05 & res_dc2$logFC > 1] <- c("FC > 1")
+res_dc2$threshold[res_dc2$PValue < 0.05 & res_dc2$logFC < -1] <- c("FC < -1")
+
+res_dc2$threshold<-factor(res_dc2$threshold)
+res_dc2$threshold<-factor(res_dc2$threshold, levels(res_dc2$threshold)[c(4,2,1,3)])
+```
+
+```{r}
+res_dc2$labels <- with(res_dc2, ifelse((abs(logFC) > 2 & PValue < 0.05)|res_dc2$gene %in% c("C1QB","THBD","MT1E"), gene, ""))
+```
+
+```{r fig.height=5, fig.width=7}
+ggplot(data=res_dc2, aes(x=logFC, y=-log10(PValue), colour=threshold)) +
+  geom_point(alpha=0.8, size=1.75) +
+  xlim(c(-6,6))+
+  ylim(c(0, 6.5)) +
+  xlab("log2 Fold Change") + ylab("-log10(p-value)") +
+  scale_color_manual(values=c("darkgrey","blue","lightgrey", "red")) +
+  geom_vline(xintercept = -1,colour="blue", linetype = "longdash") +
+  geom_vline(xintercept = 1,colour="red", linetype = "longdash") +
+  geom_hline(yintercept = -log10(0.05),colour="blue", linetype = "longdash") +
+  geom_text_repel(aes(label=labels), size=4.5) +
+  theme(panel.grid.major = element_line(colour = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(fill = NA, colour = "black", size = 1),
+        legend.position = "none", legend.key = element_blank())
+```
+## DC3
+
+```{r}
+res_dc3$threshold <- "NoVariance"
+res_dc3$threshold[res_dc3$PValue < 0.05] <- c("-1 < FC < 1")
+res_dc3$threshold[res_dc3$PValue < 0.05 & res_dc3$logFC > 1] <- c("FC > 1")
+res_dc3$threshold[res_dc3$PValue < 0.05 & res_dc3$logFC < -1] <- c("FC < -1")
+
+res_dc3$threshold<-factor(res_dc3$threshold)
+res_dc3$threshold<-factor(res_dc3$threshold, levels(res_dc3$threshold)[c(4,2,1,3)])
+```
+
+```{r}
+res_dc3$labels <- with(res_dc3, ifelse((abs(logFC) > 2 & PValue < 0.05)|res_dc3$gene %in% c("S100A8","C5AR1","ALOX5AP","THBS1","CD14","S100A9","S100A12","ADAM9","CLU"), gene, ""))
+res_dc3$labels <- with(res_dc3, ifelse(res_dc3$labels %in% c("ENSG00000276216","ENSG00000259001"), " ", res_dc3$labels))
+```
+
+```{r fig.height=5, fig.width=7}
+ggplot(data=res_dc3, aes(x=logFC, y=-log10(PValue), colour=threshold)) +
+  geom_point(alpha=0.8, size=1.75) +
+  xlim(c(-6,6))+
+  ylim(c(0, 6.5)) +
+  xlab("log2 Fold Change") + ylab("-log10(p-value)") +
+  scale_color_manual(values=c("darkgrey","blue","lightgrey", "red")) +
+  geom_vline(xintercept = -1,colour="blue", linetype = "longdash") +
+  geom_vline(xintercept = 1,colour="red", linetype = "longdash") +
+  geom_hline(yintercept = -log10(0.05),colour="blue", linetype = "longdash") +
+  geom_text_repel(aes(label=labels), size=4.5) +
+  theme(panel.grid.major = element_line(colour = "white"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(fill = NA, colour = "black", size = 1),
+        legend.position = "none", legend.key = element_blank())
+
+```
+# Boxplots of selected genes
+
+## DC2
+
+```{r}
+genes <- c('HLA-DRA','HLA-DQA2','HLA-DPB1','HLA-DPA1','CD86','IL1B','CCL3','CCL4')
+
+mtx_dc2.cpm <- edgeR::cpm(dge_dc2, log = T)
+mtx_dc2.cpm <- as.data.frame(mtx_dc2.cpm)
+mtx_dc2.cpm <- mtx_dc2.cpm[genes, ]
+
+colnames(mtx_dc2.cpm) <- paste(dge_dc2$samples$condition, dge_dc2$samples$patient_id, sep = "_")
+mtx_dc2.cpm <- t(mtx_dc2.cpm)
+mtx_dc2.cpm <- as.data.frame(mtx_dc2.cpm)
+```
+
+```{r}
+mtx_dc2.cpm$condition <- ifelse(grepl('^Healthy', rownames(mtx_dc2.cpm)),'HD', ifelse(
+    grepl('^Mild', rownames(mtx_dc2.cpm)),'Mild','Severe'))
+mtx_dc2.cpm <- with(mtx_dc2.cpm, mtx_dc2.cpm[order(condition) , ])
+```
+
+```{r}
+my_comparisons <- list(c("HD", "Mild"), c("Mild", "Severe"), c("HD", "Severe"))
+
+my_plot_list <- list()
+for(i in 1:length(genes)){
+  p <- ggboxplot(mtx_dc2.cpm, x = "condition", y = genes[i], 
+                 color = "black", fill=c('pink', 'lightblue','blue'), legend = "none", 
+                 ylab = "Expression level", xlab = FALSE, title=genes[i], width = 0.8) +
+      stat_compare_means(aes(label = ..p.format..), comparisons = my_comparisons) + 
+      theme(plot.title = element_text(hjust = 0.5, size=14), axis.text.x = element_blank(), axis.title = element_blank())
+                
+  my_plot_list[[i]] <- p
+}
+```
+
+```{r fig.height=3.8, fig.width=18}
+my_plot_list[[1]]|my_plot_list[[2]]|my_plot_list[[3]]|my_plot_list[[4]]|my_plot_list[[5]]|my_plot_list[[6]]|my_plot_list[[7]]|my_plot_list[[8]]
+```
+
+## DC3
+
+```{r}
+mtx_dc3.cpm <- edgeR::cpm(dge_dc3, log = T)
+mtx_dc3.cpm <- as.data.frame(mtx_dc3.cpm)
+mtx_dc3.cpm <- mtx_dc3.cpm[genes, ]
+
+colnames(mtx_dc3.cpm) <- paste(dge_dc3$samples$condition, dge_dc3$samples$patient_id, sep = "_")
+mtx_dc3.cpm <- t(mtx_dc3.cpm)
+mtx_dc3.cpm <- as.data.frame(mtx_dc3.cpm)
+```
+
+```{r}
+mtx_dc3.cpm$condition <- ifelse(grepl('^Healthy', rownames(mtx_dc3.cpm)),'HD', ifelse(
+    grepl('^Mild', rownames(mtx_dc3.cpm)),'Mild','Severe'))
+mtx_dc3.cpm <- with(mtx_dc3.cpm, mtx_dc3.cpm[order(condition) , ])
+```
+
+```{r}
+my_plot_list <- list()
+for(i in 1:length(genes)){
+  p <- ggboxplot(mtx_dc3.cpm, x = "condition", y = genes[i], 
+                 color = "black", fill=c('pink', 'lightblue','blue'), legend = "none", 
+                 ylab = "Expression level", xlab = FALSE,title=genes[i], width = 0.8) +
+      stat_compare_means(aes(label = ..p.format..), comparisons = my_comparisons) + 
+      theme(plot.title = element_text(hjust = 0.5, size=14), axis.text.x = element_blank(), axis.title = element_blank())
+                
+  my_plot_list[[i]] <- p
+}
+```
+
+```{r fig.height=3.8, fig.width=18}
+my_plot_list[[1]]|my_plot_list[[2]]|my_plot_list[[3]]|my_plot_list[[4]]|my_plot_list[[5]]|my_plot_list[[6]]|my_plot_list[[7]]|my_plot_list[[8]]
+```
+# GSEA with Hallmark collection
+
+```{r}
+gmt.hallmark <- gmtPathways("h.all.v7.2.symbols.gmt")
+```
+
+## DC2
+
+```{r}
+rnk_dc2 <- setNames(-log10(res_dc2$PValue) * sign(res_dc2$logFC), res_dc2$gene)
+gsa_dc2.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway,NES, pval,padj,leadingEdge) %>%
+    show_dt()
+```
+
+## DC3
+
+```{r}
+rnk_dc3 <- setNames(-log10(res_dc3$PValue) * sign(res_dc3$logFC), res_dc3$gene)
+gsa_dc3.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway,NES, pval,padj,leadingEdge) %>%
+    show_dt()
+```
+
+# Pathway enrichment visualization
+
+For each cDC subset, top 15 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2.hallmark <- arrange(gsa_dc2.hallmark, pval)
+gsa_dc2.hallmark_top <- gsa_dc2.hallmark[1:15, ]
+
+gsa_dc3.hallmark <- arrange(gsa_dc3.hallmark, pval)
+gsa_dc3.hallmark_top <- gsa_dc3.hallmark[1:15, ] 
+
+pathways.hallmark <- rbind(gsa_dc2.hallmark_top, gsa_dc3.hallmark_top)
+pathways.hallmark2 <- pathways.hallmark[!duplicated(pathways.hallmark$pathway),]
+pathways.hallmark2 <- pathways.hallmark2[, -c(2:8)]
+
+result_dc2 <- merge(pathways.hallmark2, gsa_dc2.hallmark)
+result_dc2$DC_subsets <- 'DC2'
+result_dc2$count <- -log10(result_dc2$pval) 
+
+result_dc3 <- merge(pathways.hallmark2, gsa_dc3.hallmark)
+result_dc3$DC_subsets <- 'DC3'
+result_dc3$count <- -log10(result_dc3$pval) 
+
+hallmark <- rbind(result_dc2, result_dc3)
+```
+
+```{r}
+hallmark$pathway <- gsub('HALLMARK_', '', hallmark$pathway)
+hallmark$pathway <- gsub('_', ' ', hallmark$pathway)
+```
+
+```{r}
+order <- setDT(hallmark)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+hallmark <- merge(x = hallmark, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=3.5, fig.width=4.5}
+p <- ggplot(hallmark, aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-2.2, -1.3, -1, 1, 1.3, 2.2)),
+                    limits = c(-2.2, 2.2)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 00, hjust = 0.5, size=8), 
+          axis.text.y = element_text(size=7),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.2, "cm"),
+          legend.key.width = unit(0.2,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+```{r}
+ggsave("HALLMARK_severe_vs_mild.png", p, width = 4.2, height = 3, units = c("in"), dpi=600)
+```
+
+# Heatmaps with GSEA leading edge genes of the allograft rejection pathway
+
+## DC2 severe vs mild
+
+```{r fig.height=5.5, fig.width=3.5}
+colnames(mtx_dc2) <- paste(dge_dc2$samples$group_id, dge_dc2$samples$sample_id, sep = "_")
+
+mtx_dc2[gsa_dc2.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Healthy",colnames(mtx_dc2)), grep("Mild",colnames(mtx_dc2)), grep("Severe", colnames(mtx_dc2)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3 severe vs mild
+
+```{r fig.height=5.5, fig.width=3.5}
+colnames(mtx_dc3) <- paste(dge_dc3$samples$group_id, dge_dc3$samples$sample_id, sep = "_")
+
+mtx_dc3[gsa_dc3.hallmark[pathway == "HALLMARK_ALLOGRAFT_REJECTION", leadingEdge][[1]], c(grep("Healthy",colnames(mtx_dc3)),grep("Mild",colnames(mtx_dc3)), grep("Severe", colnames(mtx_dc3)) )] %>%
+    Heatmap(
+        cluster_rows = T, 
+        cluster_columns = F,
+        clustering_method_rows = "ward.D2", 
+        row_names_gp = gpar(fontsize = 6.5),
+        col = circlize::colorRamp2(seq(-2, 2, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
