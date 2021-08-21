@@ -1,0 +1,515 @@
+---
+title: "Marongiu, Protti et al. 2021 dataset"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output:
+    html_notebook:
+        self_contained: true
+        df_print: paged
+        fig_height: 6
+        fig_width: 6
+        highlight: zenburn
+        theme: cosmo
+        number_sections: yes
+        toc: yes
+        toc_depth: 6
+        toc_float:
+            collapsed: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(DropletUtils)
+library(devtools)
+library(Seurat)
+library(biomaRt)
+library(SeuratDisk)
+library(patchwork)
+library(SeuratWrappers)
+library(harmony)
+library(DT)
+library(fgsea)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(future)
+library(scater)
+library(edgeR)
+library(gghighlight)
+library(ggrepel)
+library(data.table)
+library(magrittr)
+library(ggpubr)
+library(scales)
+library(dendsort)
+
+show_dt <- function(df) { 
+    DT::datatable(
+        df,
+        class = "cell-border stripe",
+        rownames = TRUE,
+        escape = FALSE,
+        caption = NULL,
+        editable = FALSE,
+        filter = list(position = "top"),
+        extensions = c('Buttons', 'Scroller'),
+        options = list(
+            dom = 'Blfrtip',
+            scrollX = T,
+            scrollY = 500,
+            buttons = c('copy', 'csv', 'print'),
+            deferRender = TRUE,
+            scroller = TRUE
+        )
+    )
+}
+
+theme_set(theme_classic(14))
+```
+
+```{r}
+gmt.hallmark <- gmtPathways("h.all.v7.2.symbols.gmt")
+gmt.btm <- gmtPathways("BTMgenesets.gmt")
+```
+
+# Load data and pre-processing
+
+Data can be downloaded from GEO: GSE168388. 
+
+```{r}
+samples <- read_csv("samples.csv")
+sce <- read10xCounts(samples = paste("cell_ranger_out", samples$pool, sep = "/"), sample.names = samples$pool)
+
+id2symbol <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), filters = "ensembl_gene_id", values = rownames(sce), mart = useMart("ensembl", dataset = "hsapiens_gene_ensembl"))
+
+sce <- sce[rowSums(counts(sce) > 0) > 4, ]
+symbols <- id2symbol$external_gene_name[match(rownames(sce), id2symbol$ensembl_gene_id)]
+symbols <- ifelse(is.na(symbols), rownames(sce), symbols)
+symbols <- ifelse(symbols %in% symbols[duplicated(symbols)], rownames(sce), symbols)
+rownames(sce) <- symbols
+```
+
+```{r}
+seu <- as.Seurat(sce, assay = "RNA", counts = "counts", data = NULL)
+rm(sce)
+seu$nCount_RNA <- colSums(seu, slot = "counts")
+seu$nFeature_RNA = colSums(GetAssayData(seu, slot = "counts") > 0)
+```
+
+```{r}
+dim(seu)
+```
+```{r}
+seu <- PercentageFeatureSet(seu, features = grep("^MT\\-", rownames(seu), value = T), col.name = "percent.mt")
+seu <- PercentageFeatureSet(seu, features = grep("^RP[SL]", rownames(seu), value = T), col.name = "percent.rp")
+seu <- PercentageFeatureSet(seu, features = grep("^IG[KLH]", rownames(seu), value = T), col.name = "percent.ig")
+seu <- CellCycleScoring(seu, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = F)
+```
+
+```{r fig.height=4, fig.width=10}
+VlnPlot(seu, assay = "RNA", slot = "counts", features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rp"), group.by = "Sample", same.y.lims = F, log = F, pt.size = 0, ncol = 4)
+```
+```{r}
+seu <- subset(seu, subset = nFeature_RNA >= 500 & percent.mt < 10)
+```
+
+```{r}
+dim(seu)
+```
+```{r message = FALSE, warning = FALSE}
+seu <- SCTransform(seu, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA", "percent.mt"), variable.features.n = 400, return.only.var.genes = F, conserve.memory = F, seed.use = 123, verbose = F)
+```
+
+```{r}
+seu <- RunPCA(seu, assay = "SCT", npcs = 50)
+ElbowPlot(seu, ndims = 30)
+```
+```{r}
+seu <- RunHarmony(seu, assay.use = "SCT", group.by.vars = "Sample", reduction = "pca", dims.use = 1:12, verbose = F)
+seu <- RunUMAP(seu, reduction = "harmony", dims = 1:12, seed.use = 42, verbose = F)
+seu <- FindNeighbors(seu, dims = 1:12, reduction = "harmony", force.recalc = TRUE)
+seu <- FindClusters(seu, algorithm = 1, resolution = 1, random.seed = 1, verbose = F)
+```
+
+```{r fig.height=4, fig.width=6}
+DimPlot(seu, label=TRUE) + NoLegend()
+```
+# Identification of cDCs
+
+```{r fig.height=6, fig.width=14}
+FeaturePlot(seu, reduction = "umap", features = c("FCER1A","CD1C","CLEC10A","CLEC9A","CD14","CD163","C5AR1","FCAR"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol=4) 
+```
+cDCs are cluster 10: retain this cluster and re-cluster to identify cDC subpopulations.
+
+# Drill down into cDCs
+
+```{r}
+mdc <- subset(seu, subset=seurat_clusters==10)
+dim(mdc)
+```
+```{r}
+mdc <- SCTransform(mdc, assay = "RNA", new.assay.name = "SCT", do.correct.umi = T, vars.to.regress = c("nCount_RNA"), variable.features.n = 100, return.only.var.genes = F, conserve.memory = F, seed.use = 123, verbose = F)
+```
+```{r}
+mdc <- RunPCA(mdc, assay = "SCT", npcs = 50)
+ElbowPlot(mdc, ndims = 30)
+```
+```{r}
+mdc <- RunHarmony(mdc, assay.use = "SCT", group.by.vars = "Sample", reduction = "pca", dims.use = 1:12, verbose = F)
+mdc <- RunUMAP(mdc, reduction = "harmony", dims = 1:12, seed.use = 42, verbose = F)
+mdc <- FindNeighbors(mdc, dims = 1:12, reduction = "harmony", force.recalc = TRUE)
+mdc <- FindClusters(mdc, algorithm = 1, resolution = 0.6, random.seed = 1, verbose = F)
+```
+```{r}
+mdc$disease <- ifelse(mdc$Sample %in% c('HD_1','HD_2'), 'healthy', 'covid')
+```
+
+```{r fig.height=3.5, fig.width=6}
+p1 <- DimPlot(mdc, reduction = "umap", group.by = c("seurat_clusters"),  
+              cols = c('1' = '#00A9FF', '2' = '#7CAE00', '0' = '#8494FF', '3' = '#0CB702'), 
+              label = T) + NoLegend()
+p2 <- DimPlot(mdc, reduction = "umap", group.by = c("disease"), label = F)
+p1 | p2
+```
+```{r fig.height=10, fig.width=10}
+FeaturePlot(mdc, reduction = "umap", features = c("HLA-DRB1","CLEC10A","CLEC9A","CD1C","FCER1A","CD163","CD14", "S100A8","CD5"), order = T, min.cutoff = "q05", max.cutoff = "q95", ncol = 3)
+```
+```{r fig.height=4.5, fig.width=5}
+VlnPlot(mdc, features = c("HLA-DRB1","CLEC10A","CLEC9A","CD14","CD163","S100A8"), pt.size = 0, ncol = 3, cols = c('1' = '#00A9FF', '2' = '#7CAE00', '0' = '#8494FF', '3' = '#0CB702')) & theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+Two cDC subsets are identified:
+
+- 0+1 are DC3
+
+- 2+3 are DC2
+
+```{r}
+mdc$dc <- ifelse(
+    mdc$seurat_clusters %in% c(2,3), "DC2", "DC3"
+)
+```
+
+```{r}
+saveRDS(mdc, 'mdc_dataset1.rds')
+```
+
+# Pseudobulk differential analysis 
+
+Aggregate DCs by type and donor, then run differential test on aggregated counts. This ensures that the unit of independent replication is the sample (donor), not the cell.
+
+```{r}
+sce <- as.SingleCellExperiment(mdc, assay = "SCT")
+sce <- sce[rowSums(counts(sce) > 1) >= 5, ]
+
+t(table(sce$dc, sce$Sample))
+```
+## DC2
+
+###  COVID19 vs Healthy 
+
+Donor `covid_1` removed due to insufficient numbers of cells (< 10 DC2s). 
+
+#### DEGs
+
+```{r}
+sce_dc2 <- sce[, (!sce$Sample %in% c("Covid_1")) & (!sce$dc %in% c("DC3"))]
+```
+
+```{r}
+sce_dc2$group_id <- factor(sce_dc2$disease, levels = c("healthy", "covid"))
+sce_dc2$sample_id <- factor(sce_dc2$Sample)
+
+dge_dc2 <- aggregateAcrossCells(sce_dc2, id = colData(sce_dc2)[, c("sample_id")])
+dge_dc2 <- calcNormFactors(dge_dc2)
+
+mtx_dc2 <- t(scale(t(edgeR::cpm(dge_dc2, log = T))))
+
+dsn_dc2 <- model.matrix(~group_id, dge_dc2$samples)
+dge_dc2 <- estimateDisp(dge_dc2, dsn_dc2)
+fit_dc2 <- glmQLFit(dge_dc2, dsn_dc2, robust = T)
+
+res_dc2 <- glmQLFTest(fit_dc2, coef = "group_idcovid") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc2 %>%
+    show_dt()
+```
+
+#### GSEA with Hallmark
+
+```{r}
+rnk_dc2 <- setNames(-log10(res_dc2$PValue) * sign(res_dc2$logFC), res_dc2$gene)
+gsa_dc2.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc2, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+#### GSEA with BTM
+
+```{r}
+gsa_dc2.btm <- fgseaMultilevel(gmt.btm, rnk_dc2, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc2.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+
+## DC3
+
+###  COVID19 vs Healthy 
+
+#### DEGs
+
+```{r}
+sce_dc3 <- sce[, (sce$dc %in% c("DC3"))]
+```
+
+```{r}
+sce_dc3$group_id <- factor(sce_dc3$disease, levels = c("healthy", "covid"))
+sce_dc3$sample_id <- factor(sce_dc3$Sample)
+
+dge_dc3 <- aggregateAcrossCells(sce_dc3, id = colData(sce_dc3)[, c("sample_id")])
+dge_dc3 <- calcNormFactors(dge_dc3)
+
+mtx_dc3 <- t(scale(t(edgeR::cpm(dge_dc3, log = T))))
+
+dsn_dc3 <- model.matrix(~ group_id, dge_dc3$samples)
+dge_dc3 <- estimateDisp(dge_dc3, dsn_dc3)
+fit_dc3 <- glmQLFit(dge_dc3, dsn_dc3, robust = T)
+
+res_dc3 <- glmQLFTest(fit_dc3, coef = "group_idcovid") %>%
+    topTags(n = Inf) %>% 
+    `[[`("table") %>%
+    `[`(c("logFC", "PValue", "FDR")) %>%
+    rownames_to_column("gene") %>%
+    as_tibble()
+```
+
+```{r}
+res_dc3 %>%
+    show_dt()
+```
+#### GSEA with Hallmark
+
+```{r}
+rnk_dc3 <- setNames(-log10(res_dc3$PValue) * sign(res_dc3$logFC), res_dc3$gene)
+gsa_dc3.hallmark <- fgseaMultilevel(gmt.hallmark, rnk_dc3, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3.hallmark %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+#### GSEA with BTM
+
+```{r}
+gsa_dc3.btm <- fgseaMultilevel(gmt.btm, rnk_dc3, minSize = 10, maxSize = 500, sampleSize = 100)
+```
+
+```{r}
+gsa_dc3.btm %>%
+    as_tibble() %>%
+    arrange(pval) %>%
+    dplyr::select(pathway, NES, pval, padj, leadingEdge) %>%
+    show_dt()
+```
+# Heatmap with top 100 DEGs for DC2 and DC3
+
+- Rows: Top 100 DEGs for DC2 or DC3 in COVID19 vs Healthy 
+
+- Columns: samples aggregated by donor and cell type
+
+- Cells: Z-scores, log2 CPMs
+
+Remove RP genes.
+
+## DC2
+
+```{r}
+genes_dc2 <- arrange(res_dc2, PValue)
+genes_dc2 <- genes_dc2[!grepl("^RP[LS]",genes_dc2$gene),]
+genes_dc2_top100 <- genes_dc2[1:100, 1]
+
+mtx_dc2.df <- as.data.frame(mtx_dc2)
+mtx_dc2.df$gene <- row.names(mtx_dc2.df)
+
+mtx_dc2.df_top100 <- merge(genes_dc2_top100, mtx_dc2.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc2.df_top100) <- mtx_dc2.df_top100$gene
+mtx_dc2.df_top100$gene <- NULL
+mtx_dc2.df_top100 <- mtx_dc2.df_top100[,c(3,4,1,2)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc2.df_top100), method="ward.D2"), isReverse = F)
+
+mtx_dc2.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+## DC3
+
+```{r}
+genes_dc3 <- arrange(res_dc3, PValue)
+genes_dc3 <- genes_dc3[!grepl("^RP[LS]",genes_dc3$gene),]
+genes_dc3_top100 <- genes_dc3[1:100, 1]
+
+mtx_dc3.df <- as.data.frame(mtx_dc3)
+mtx_dc3.df$gene <- row.names(mtx_dc3.df)
+
+mtx_dc3.df_top100 <- merge(genes_dc3_top100, mtx_dc3.df, by = 'gene', all.x=TRUE)
+row.names(mtx_dc3.df_top100) <- mtx_dc3.df_top100$gene
+mtx_dc3.df_top100$gene <- NULL
+mtx_dc3.df_top100 <- mtx_dc3.df_top100[,c(4,5,1,2,3)]
+```
+
+```{r fig.height=10, fig.width=3.5}
+dend <- dendsort(hclust(dist(mtx_dc3.df_top100), method="ward.D2"), isReverse = T)
+
+mtx_dc3.df_top100 %>%
+    Heatmap(
+        cluster_rows = dend, 
+        cluster_columns = F, 
+        row_names_gp = gpar(fontsize = 7.5),
+        col = circlize::colorRamp2(seq(-2.5, 2.5, length.out = 11), rev(brewer.pal(11, "RdYlBu")))
+    )
+```
+# Pathway enrichment visualization
+
+## Hallmark
+
+For each cDC subset, top 15 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2.hallmark <- arrange(gsa_dc2.hallmark, pval)
+gsa_dc2.hallmark_top <- gsa_dc2.hallmark[1:15, ]
+
+gsa_dc3.hallmark <- arrange(gsa_dc3.hallmark, pval)
+gsa_dc3.hallmark_top <- gsa_dc3.hallmark[1:15, ] 
+
+pathways.hallmark <- rbind(gsa_dc2.hallmark_top, gsa_dc3.hallmark_top)
+pathways.hallmark2 <- pathways.hallmark[!duplicated(pathways.hallmark$pathway),]
+pathways.hallmark2 <- pathways.hallmark2[, -c(2:8)]
+
+result_dc2 <- merge(pathways.hallmark2, gsa_dc2.hallmark)
+result_dc2$DC_subsets <- 'DC2'
+result_dc2$count <- -log10(result_dc2$pval) 
+
+result_dc3 <- merge(pathways.hallmark2, gsa_dc3.hallmark)
+result_dc3$DC_subsets <- 'DC3'
+result_dc3$count <- -log10(result_dc3$pval) 
+
+hallmark <- rbind(result_dc2, result_dc3)
+```
+
+```{r}
+hallmark$pathway <- gsub('HALLMARK_', '', hallmark$pathway)
+hallmark$pathway <- gsub('_', ' ', hallmark$pathway)
+```
+
+```{r}
+order <- setDT(hallmark)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+hallmark <- merge(x = hallmark, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=4, fig.width=4.5}
+p <- ggplot(hallmark, aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-2.6, -1.5, -1.2, 1.2, 1.5, 2.6)),
+                    limits = c(-2.6, 2.6)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 00, hjust = 0.5, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5),
+          legend.position="right")
+p
+```
+```{r}
+ggsave("hallmark.png", p, width = 4.5, height = 4.5, units = c("in"), dpi=600)
+```
+
+## BTM
+
+For each cDC subset, top 10 pathways (ordered by pvalue) are selected, merged and shown.
+
+```{r}
+gsa_dc2.btm <- arrange(gsa_dc2.btm, pval)
+gsa_dc2.btm_top <- gsa_dc2.btm[1:10, ]
+
+gsa_dc3.btm <- arrange(gsa_dc3.btm, pval)
+gsa_dc3.btm_top <- gsa_dc3.btm[1:10, ] 
+
+pathways.btm <- rbind(gsa_dc2.btm_top, gsa_dc3.btm_top)
+pathways.btm2 <- pathways.btm[!duplicated(pathways.btm$pathway),]
+pathways.btm2 <- pathways.btm2[, -c(2:8)]
+
+result_dc2 <- merge(pathways.btm2, gsa_dc2.btm)
+result_dc2$DC_subsets <- 'DC2'
+result_dc2$count <- -log10(result_dc2$pval) 
+
+result_dc3 <- merge(pathways.btm2, gsa_dc3.btm)
+result_dc3$DC_subsets <- 'DC3'
+result_dc3$count <- -log10(result_dc3$pval) 
+
+btm <- rbind(result_dc2, result_dc3)
+```
+
+```{r}
+order <- setDT(btm)[, lapply(.SD, sum), by = pathway, .SDcols = 'NES']
+names(order)[names(order) == "NES"] <- "rowwise_sum_NES"
+btm <- merge(x = btm, y = order, by='pathway', all.x = TRUE)
+```
+
+```{r fig.height=4, fig.width=6.5}
+p <- ggplot(btm, aes(x = DC_subsets, y = fct_reorder(pathway,rowwise_sum_NES))) +
+    geom_point(aes(size = count, colour = NES)) +
+    ylab(NULL) + xlab(NULL) + 
+    scale_color_gradientn(colors = c("darkblue", "lightblue", "white", "pink", "darkred"),
+                    values = scales::rescale(c(-2.6, -1.5, -1.2, 1.2, 1.5, 2.6)),
+                    limits = c(-2.6, 2.6)) +
+    labs(size = "-Log10(PValue)") +
+    theme(axis.text.x = element_text(angle = 00, hjust = 0.5, size=10), 
+          axis.text.y = element_text(size=10),
+          legend.title = element_text(size = 9),
+          legend.key.size = unit(0.25, "cm"),
+          legend.key.width = unit(0.25,"cm"), 
+          legend.text=element_text(size=5))
+p
+```
+```{r}
+ggsave("btm.png", p, width = 6.5, height = 4.5, units = c("in"), dpi=600)
+```
